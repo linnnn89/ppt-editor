@@ -1,22 +1,27 @@
 {
   "name": "ppt-editor",
-  "version": "0.1.1",
+  "version": "0.4.0-rc.4",
   "private": true,
   "description": "Task-scoped PowerPoint editing with JavaScript, OOXML and native Office automation",
   "type": "module",
+  "bin": {
+    "ppt-task": "./src/cli.js"
+  },
   "engines": {
     "node": ">=24 <25"
   },
   "scripts": {
     "postinstall": "node scripts/build-native.js",
     "build:native": "node scripts/build-native.js",
-    "test": "node --test --test-concurrency=1 tests/*.test.js",
+    "test": "node --expose-gc --test --test-concurrency=1 tests/*.test.js",
     "test:native-gc": "node scripts/diagnose-native.cjs",
     "test:native": "node scripts/verify-native.js",
     "test:lifecycle": "node --expose-gc scripts/verify-lifecycle.js",
     "benchmark": "node --expose-gc scripts/benchmark-pptx.js",
     "benchmark:fast": "node --expose-gc scripts/benchmark-pptx.js --methods xml-reuse --trials 1",
-    "check": "node scripts/check-source.js"
+    "check": "node scripts/check-source.js",
+    "check:privacy": "node scripts/check-privacy.js",
+    "mcp": "node src/mcp.js"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "2.0.0",

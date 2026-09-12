@@ -74,7 +74,12 @@ export async function waitForExit(identity, timeoutMs = 10000) {
   if (!handle) { if (GetLastError() === 87) return true; throw new PptError('PROCESS_ACCESS_ERROR', 'Unable to verify process exit.'); }
   try {
     if (Wait(handle, 0) === 0) return true;
-    if (identityFromHandle(handle, identity.pid).created !== identity.created) return true;
+    try {
+      const created = Buffer.alloc(8), exited = Buffer.alloc(8), kernelTime = Buffer.alloc(8), userTime = Buffer.alloc(8);
+      if (GetProcessTimes(handle, created, exited, kernelTime, userTime)) {
+        if (created.readBigUInt64LE().toString() !== identity.created) return true;
+      }
+    } catch {}
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const state = Wait(handle, 0);

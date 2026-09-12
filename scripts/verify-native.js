@@ -26,6 +26,9 @@ function verifyEdits(snapshot) {
   }
   assert.equal(snapshot.objects.find(o => o.kind === 'table').rows[1][1], '18');
   assert.equal(snapshot.objects.find(o => o.kind === 'notes').text, 'Revised notes');
+  const bg = snapshot.objects.find(o => o.kind === 'background');
+  assert.ok(bg);
+  assert.equal(bg.color, '123456');
 }
 try {
   await host.start();
@@ -33,14 +36,15 @@ try {
   const opened = await host.request('open', { documentId, path: working, directory: root, visible: false });
   report.lease = opened.lease; report.openedObjects = opened.snapshot.objects.length;
   for (const identity of opened.lease.observedNewProcesses) assert.equal(job.contains(identity.pid), false, 'PowerPoint must not be in the owned Node job');
-  const heading = opened.snapshot.objects.find(o => o.name === 'Heading'), table = opened.snapshot.objects.find(o => o.kind === 'table'), notes = opened.snapshot.objects.find(o => o.kind === 'notes');
-  assert.ok(heading && table && notes);
+  const heading = opened.snapshot.objects.find(o => o.name === 'Heading'), table = opened.snapshot.objects.find(o => o.kind === 'table'), notes = opened.snapshot.objects.find(o => o.kind === 'notes'), bg = opened.snapshot.objects.find(o => o.kind === 'background');
+  assert.ok(heading && table && notes && bg);
   const applied = await host.request('apply', { documentId, generation: opened.generation, operations: [
     { type: 'replace_text', target: heading, search: 'Original', replacement: 'Revised', expectedMatches: 1, crossRunPolicy: 'reject' },
     { type: 'set_style', target: heading, style: { fontSize: 28, color: '224466' } },
     { type: 'set_geometry', target: heading, geometry: { left: 80 } },
     { type: 'set_table_cell', target: table, row: 2, column: 2, text: '18', formatPolicy: 'first_run' },
-    { type: 'replace_text', target: notes, search: 'Original', replacement: 'Revised', expectedMatches: 1, crossRunPolicy: 'reject' }
+    { type: 'replace_text', target: notes, search: 'Original', replacement: 'Revised', expectedMatches: 1, crossRunPolicy: 'reject' },
+    { type: 'set_slide_background', target: bg, color: '123456' }
   ] });
   report.apply = applied; assert.equal(applied.outcome, 'completed');
   verifyEdits(applied.snapshot);

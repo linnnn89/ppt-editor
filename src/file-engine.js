@@ -2,7 +2,8 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { check } from './errors.js';
 import { hash, stableJson, writeJson, readJson, atomicWrite } from './storage.js';
-import { NS, child, children, descendants, parseXml, xml, rels, resolvePart, setChild, readPackage, writePackage, validatePackage } from './ooxml.js';
+import { advancedObject } from './advanced-objects.js';
+import { NS, child, children, descendants, parseXml, xml, rels, relationshipsPath, resolvePart, setChild, readPackage, writePackage, writePackageOptimized, validatePackage } from './ooxml.js';
 
 const PT = 12700;
 const numeric = (node, attr, factor = 1) => node?.hasAttribute(attr) ? Number(node.getAttribute(attr)) / factor : null;
@@ -20,7 +21,7 @@ function runStyle(run) {
   const prop = child(run, NS.a, 'rPr');
   const color = colorNode(prop)?.getAttribute('val') || null;
   const scheme = child(child(prop, NS.a, 'solidFill'), NS.a, 'schemeClr')?.getAttribute('val') || null;
-  return { fontSize: numeric(prop, 'sz', 100), fontFace: child(prop, NS.a, 'latin')?.getAttribute('typeface') || null, bold: prop?.hasAttribute('b') ? prop.getAttribute('b') === '1' : null, italic: prop?.hasAttribute('i') ? prop.getAttribute('i') === '1' : null, color, themeColor: scheme, source: 'explicit-run-properties; null means inherited or unspecified' };
+  return { underline: prop?.hasAttribute('u') ? prop.getAttribute('u') !== 'none' : null, fontFaceFarEast: child(prop, NS.a, 'ea')?.getAttribute('typeface') || null, fontSize: numeric(prop, 'sz', 100), fontFace: child(prop, NS.a, 'latin')?.getAttribute('typeface') || null, bold: prop?.hasAttribute('b') ? prop.getAttribute('b') === '1' : null, italic: prop?.hasAttribute('i') ? prop.getAttribute('i') === '1' : null, color, themeColor: scheme, source: 'explicit-run-properties; null means inherited or unspecified' };
 }
 
 function geometryOf(shape) {
@@ -29,7 +30,7 @@ function geometryOf(shape) {
   return { left: numeric(offset, 'x', PT), top: numeric(offset, 'y', PT), width: numeric(extent, 'cx', PT), height: numeric(extent, 'cy', PT), rotation: numeric(transform, 'rot', 60000) ?? 0, unit: 'pt', source: transform ? 'explicit' : 'inherited-unresolved' };
 }
 
-export function indexPackage(parts) {
+export function indexPackage(parts, { slides: selected } = {}) {
   const presentation = parseXml(parts.get('ppt/presentation.xml'));
   const relationMap = new Map(rels(parts, 'ppt/presentation.xml').map(r => [r.id, r]));
   const size = child(presentation.documentElement, NS.p, 'sldSz');
@@ -37,9 +38,36 @@ export function indexPackage(parts) {
   for (const entry of descendants(presentation, NS.p, 'sldId')) {
     const slideId = Number(entry.getAttribute('id')), slideNumber = slides.length + 1;
     const part = resolvePart('ppt/presentation.xml', relationMap.get(entry.getAttributeNS(NS.r, 'id')).target);
+    if (selected && !selected.includes(slideNumber)) {
+      slides.push({ slide: slideNumber, slideId, part, objectCount: null, indexed: false });
+      continue;
+    }
     const doc = parseXml(parts.get(part), part);
     const tree = descendants(doc, NS.p, 'spTree')[0];
     const slide = { slide: slideNumber, slideId, part, objectCount: 0 };
+    // 索引幻灯片背景对象，支持 set_slide_background
+    const cSld = child(doc.documentElement, NS.p, 'cSld');
+    const bg = cSld ? child(cSld, NS.p, 'bg') : null;
+    const bgPr = bg ? child(bg, NS.p, 'bgPr') : null;
+    const bgColor = bgPr ? (colorNode(bgPr)?.getAttribute('val') || null) : null;
+    const bgItem = {
+      key: `background:${slideId}::0`,
+      part,
+      slide: slideNumber,
+      slideId,
+      shapeId: 0,
+      groupPath: [],
+      name: 'Background',
+      kind: 'background',
+      color: bgColor,
+      fill: describeBackground(parts, part, bg),
+      text: '',
+      runs: [],
+      capabilities: ['set_slide_background']
+    };
+    bgItem.fingerprint = hash(bg ? xml(bg) : `empty-bg-${slideId}`);
+    objects.push(bgItem);
+    slide.objectCount++;
     function visit(container, groups = [], notes = false, sourcePart = part) {
       for (const shape of children(container, NS.p)) {
         if (!['sp', 'pic', 'graphicFrame', 'grpSp', 'cxnSp'].includes(shape.localName)) continue;
@@ -50,10 +78,12 @@ export function indexPackage(parts) {
         const table = descendants(shape, NS.a, 'tbl')[0];
         const placeholder = descendants(shape, NS.p, 'ph')[0];
         if (notes && placeholder?.getAttribute('type') !== 'body') continue;
-        const kind = notes ? 'notes' : table ? 'table' : body ? 'text' : shape.localName === 'pic' ? 'image' : shape.localName === 'grpSp' ? 'group' : 'shape';
+        const advanced = advancedObject(parts, sourcePart, shape);
+        const kind = notes ? 'notes' : advanced.kind || (table ? 'table' : body ? 'text' : shape.localName === 'pic' ? 'image' : shape.localName === 'grpSp' ? 'group' : 'shape');
         const tableRows = table ? children(table, NS.a, 'tr').map(row => children(row, NS.a, 'tc').map(cell => textBodyText(child(cell, NS.a, 'txBody')))) : undefined;
         const key = `${notes ? 'notes' : 'slide'}:${slideId}:${groups.join('.')}:${id}`;
         const item = {
+          ...advanced,
           key, part: sourcePart, slide: slideNumber, slideId, shapeId: id, groupPath: groups, name: identity.getAttribute('name') || '', kind,
           text: body ? textBodyText(body) : tableRows ? tableRows.map(row => row.join('\t')).join('\n') : '',
           geometry: geometryOf(shape), placeholder: placeholder?.getAttribute('type') || null,
@@ -63,7 +93,8 @@ export function indexPackage(parts) {
         item.fingerprint = hash(xml(shape));
         item.capabilities = [
           ...(body ? ['replace_text', 'set_style'] : []), ...(table ? ['set_table_cell'] : []),
-          ...(!notes && groups.length === 0 && kind !== 'group' && item.geometry.source === 'explicit' ? ['set_geometry'] : [])
+          ...(!notes && groups.length === 0 && kind !== 'group' && (item.geometry.source === 'explicit' ||
+            (shape.localName === 'sp' && placeholder && child(shape, NS.p, 'spPr'))) ? ['set_geometry'] : [])
         ];
         objects.push(item); slide.objectCount++;
         if (shape.localName === 'grpSp') visit(shape, [...groups, id], notes, sourcePart);
@@ -79,6 +110,23 @@ export function indexPackage(parts) {
     slides.push(slide);
   }
   return { width: numeric(size, 'cx', PT), height: numeric(size, 'cy', PT), slides, objects };
+}
+
+// Include inherited layout/theme and media dependencies without parsing other
+// slides' object trees. A master change must invalidate every dependent page.
+export function layoutPageHashes(parts) {
+  const index = indexPackage(parts, { slides: [] }), digests = new Map();
+  return new Map(index.slides.map(slide => {
+    const visited = new Set();
+    const visit = part => {
+      if (visited.has(part)) return;
+      visited.add(part);
+      if (!digests.has(part)) digests.set(part, hash(Buffer.concat([parts.get(part), parts.get(relationshipsPath(part)) || Buffer.alloc(0)])));
+      for (const r of rels(parts, part)) if (!r.external && !r.type.endsWith('/slide') && !r.type.endsWith('/notesSlide')) visit(resolvePart(part, r.target));
+    };
+    visit(slide.part);
+    return [slide.slide, hash(stableJson([index.width, index.height, [...visited].sort().map(part => [part, digests.get(part)])]))];
+  }));
 }
 
 function locateShape(doc, locator) {
@@ -125,7 +173,7 @@ function replaceBody(body, op) {
   return { matches: matches.length };
 }
 
-function styleBody(body, style) {
+export function styleBody(body, style) {
   for (const paragraph of children(body, NS.a, 'p')) {
     const properties = children(paragraph, NS.a, 'r').map(r => {
       let prop = child(r, NS.a, 'rPr');
@@ -137,6 +185,7 @@ function styleBody(body, style) {
       if (style.fontSize !== undefined) prop.setAttribute('sz', String(Math.round(style.fontSize * 100)));
       if (style.bold !== undefined) prop.setAttribute('b', style.bold ? '1' : '0');
       if (style.italic !== undefined) prop.setAttribute('i', style.italic ? '1' : '0');
+      if (style.underline !== undefined) prop.setAttribute('u', style.underline ? 'sng' : 'none');
       if (style.fontFace !== undefined) for (const name of ['a:latin', 'a:ea', 'a:cs']) setChild(prop, NS.a, name).setAttribute('typeface', style.fontFace);
       if (style.color !== undefined) {
         for (const item of children(prop, NS.a)) if (['solidFill', 'noFill', 'gradFill', 'pattFill', 'blipFill', 'grpFill'].includes(item.localName)) prop.removeChild(item);
@@ -190,7 +239,7 @@ export class FileEngine {
     validatePackage(engine.parts); return engine;
   }
 
-  inspect() { return indexPackage(this.parts); }
+  inspect(options) { return indexPackage(this.parts, options); }
   validate() {
     const structural = validatePackage(this.parts);
     const changedParts = [], preservedParts = [];
@@ -208,14 +257,30 @@ export class FileEngine {
     for (const op of operations) {
       const item = baseline.get(op.target.key);
       if (!documents.has(item.part)) documents.set(item.part, parseXml(candidate.get(item.part), item.part));
-      const doc = documents.get(item.part), shape = locateShape(doc, item), body = child(shape, NS.p, 'txBody');
+      const doc = documents.get(item.part);
+      if (op.type === 'set_slide_background') {
+        const fill = op.fill || { type: 'solid', color: op.color };
+        setBackgroundXml(candidate, item.part, fill, op.imageData, doc);
+        changes.push({ type: op.type, key: item.key, fillType: fill.type, ...(fill.type === 'solid' ? { color: fill.color.toUpperCase() } : {}) });
+        continue;
+      }
+      const shape = locateShape(doc, item), body = child(shape, NS.p, 'txBody');
       let detail = {};
       if (op.type === 'replace_text') detail = replaceBody(body, op);
       if (op.type === 'set_style') styleBody(body, op.style);
       if (op.type === 'set_geometry') {
-        const transform = child(child(shape, NS.p, 'spPr'), NS.a, 'xfrm') || child(shape, NS.p, 'xfrm');
-        check(transform, 'GEOMETRY_UNSUPPORTED', 'Explicit geometry is required.');
+        const properties = child(shape, NS.p, 'spPr');
+        let transform = child(properties, NS.a, 'xfrm') || child(shape, NS.p, 'xfrm');
+        if (!transform) {
+          // A complete absolute transform overrides placeholder inheritance;
+          // partial edits must never guess the missing master/layout values.
+          check(properties && ['left','top','width','height','rotation'].every(k => Number.isFinite(op.geometry[k])),
+            'GEOMETRY_REQUIRES_FULL', 'Inherited geometry requires explicit left, top, width, height and rotation.');
+          transform = doc.createElementNS(NS.a, 'a:xfrm'); properties.insertBefore(transform, properties.firstChild);
+          setChild(transform, NS.a, 'a:off'); setChild(transform, NS.a, 'a:ext');
+        }
         const offset = child(transform, NS.a, 'off'), extent = child(transform, NS.a, 'ext');
+        check(offset && extent, 'GEOMETRY_UNSUPPORTED', 'Geometry transform is incomplete.');
         for (const [key, attr] of [['left', 'x'], ['top', 'y']]) if (op.geometry[key] !== undefined) offset.setAttribute(attr, String(Math.round(op.geometry[key] * PT)));
         for (const [key, attr] of [['width', 'cx'], ['height', 'cy']]) if (op.geometry[key] !== undefined) extent.setAttribute(attr, String(Math.round(op.geometry[key] * PT)));
         if (op.geometry.rotation !== undefined) transform.setAttribute('rot', String(Math.round(((op.geometry.rotation % 360 + 360) % 360) * 60000)));
@@ -229,7 +294,12 @@ export class FileEngine {
   }
 
   async apply(operations, { dryRun = false } = {}) {
-    const prepared = this.prepare(operations);
+    const resolved = [];
+    for (const op of operations) {
+      const imageData = op.type === 'set_slide_background' && ['image', 'texture'].includes(op.fill?.type) ? await readBackgroundImage(op.fill.path) : undefined;
+      resolved.push(imageData ? { ...op, imageData } : op);
+    }
+    const prepared = this.prepare(resolved);
     if (dryRun) return { outcome: 'preflight_passed', revision: this.revision, changes: prepared.changes };
     const previous = this.parts, revision = this.revision;
     this.parts = prepared.candidate; this.revision++;
@@ -247,5 +317,11 @@ export class FileEngine {
     await writeJson(path.join(this.directory, 'revision.json'), { revision: this.revision, sourceHash: hash(this.sourceBytes), overlay });
   }
 
-  async bytes() { return writePackage(this.parts); }
+  async bytes() {
+    if (this.sourceBytes && this.sourceParts) {
+      return writePackageOptimized(this.sourceBytes, this.parts, this.sourceParts);
+    }
+    return writePackage(this.parts);
+  }
 }
+import { setBackgroundXml, describeBackground, readBackgroundImage } from './background.js';

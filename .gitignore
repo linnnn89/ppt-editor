@@ -2,6 +2,8 @@ node_modules/
 work/
 outputs/
 .ppt-editor/
+.codex/config.toml
+.agents/skills/ppt-editor/
 *.log
 *.tmp
 coverage/
@@ -21,3 +23,4 @@ coverage/
 *.csv
 private/
 local-data/
+TEMP/

@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { execFileSync, spawnSync } from 'node:child_process';
+
+test('privacy checks staged bytes, untracked skills and sensitive filenames without echoing matches', async () => {
+  const root = path.resolve('work/tests/privacy', randomUUID());
+  await fs.mkdir(path.join(root, 'skills', 'sample'), { recursive: true });
+  const git = args => execFileSync('git', args, { cwd: root, windowsHide: true, stdio: 'pipe' });
+  git(['init', '--quiet']);
+  const secret = ['sk', 'synthetic'.repeat(5)].join('-');
+  await fs.writeFile(path.join(root, 'CHANGELOG.md'), secret);
+  git(['add', 'CHANGELOG.md']);
+  await fs.writeFile(path.join(root, 'CHANGELOG.md'), 'Clean working copy.');
+  await fs.writeFile(path.join(root, 'skills/sample/SKILL.md'), `const source = '${['private', 'example.pptx'].join('/')}';`);
+  await fs.writeFile(path.join(root, '.env.secret'), 'SYNTHETIC=1');
+  const run = () => spawnSync(process.execPath, [path.resolve('scripts/check-privacy.js')], { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 10000 });
+  const result = run();
+  assert.equal(result.status, 1);
+  const output = result.stdout + result.stderr;
+  assert.match(output, /index.*CHANGELOG.md/);
+  assert.match(output, /skills\/sample\/SKILL.md/);
+  assert.match(output, /\.env.secret/);
+  assert.ok(!output.includes(secret), 'matched credentials must be redacted');
+  await fs.writeFile(path.join(root, 'skills/sample/SKILL.md'), 'Use an explicitly supplied source path.');
+  await fs.unlink(path.join(root, '.env.secret'));
+  git(['add', 'CHANGELOG.md', 'skills']);
+  const clean = run();
+  assert.equal(clean.status, 0, clean.stdout + clean.stderr);
+  assert.match(clean.stdout, /manual review/i);
+});

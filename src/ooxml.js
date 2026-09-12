@@ -141,11 +141,43 @@ export function validatePackage(parts) {
   return { level: 'package', passed: true, parts: parts.size, relationships: relationshipCount, slides: slideIds.size };
 }
 
-export function checkNativeSafe(parts) {
+export async function checkNativeSafe(parts) {
+  const workbooks = new Set();
   for (const name of parts.keys()) {
-    check(!/(^ppt\/embeddings\/|oleObject|activeX\/)/i.test(name), 'NATIVE_CONTENT_UNSUPPORTED', 'Embedded objects/workbooks are not enabled for native opening in this release.');
+    check(!/(oleObject|activeX\/)/i.test(name), 'NATIVE_CONTENT_UNSUPPORTED', 'OLE and ActiveX objects are not enabled for native opening.');
     if (name.endsWith('.rels')) for (const rel of rels(parts, relationshipsSource(name))) {
       check(!rel.external || rel.type.endsWith('/hyperlink'), 'NATIVE_EXTERNAL_CONTENT', 'Native opening of external data/media relationships is not enabled.');
+      check(!/\/(oleObject|activeXControl)$/.test(rel.type), 'NATIVE_CONTENT_UNSUPPORTED', 'OLE/ActiveX relationships are not supported.');
+      if (!rel.external) {
+        const source = relationshipsSource(name), target = resolvePart(source, rel.target);
+        if (/^ppt\/embeddings\//i.test(target)) {
+          check(/^ppt\/charts\/[^/]+\.xml$/.test(source) && rel.type.endsWith('/package') && /\.xlsx$/i.test(target),
+            'NATIVE_CONTENT_UNSUPPORTED', 'Only chart-owned XLSX data workbooks are supported.');
+          workbooks.add(target);
+        }
+      }
+    }
+  }
+  for (const name of parts.keys()) if (/^ppt\/embeddings\//i.test(name)) {
+    check(workbooks.has(name), 'NATIVE_CONTENT_UNSUPPORTED', 'Unreferenced or non-chart embedded content is unsupported.');
+    const bytes = parts.get(name), entries = zipManifest(bytes);
+    check(bytes.length <= 20 * 1024 * 1024 && entries.reduce((sum,e)=>sum+e.uncompressed,0) <= 40 * 1024 * 1024,
+      'NATIVE_CONTENT_UNSUPPORTED', 'Chart workbook exceeds supported size.');
+    const zip = await JSZip.loadAsync(bytes, { checkCRC32: true }), workbook = new Map();
+    for (const entry of entries.filter(e=>!e.name.endsWith('/'))) {
+      check(/^(\[Content_Types\]\.xml|_rels\/\.rels|docProps\/(app|core)\.xml|xl\/(workbook\.xml|styles\.xml|sharedStrings\.xml|calcChain\.xml|theme\/theme\d+\.xml|worksheets\/sheet\d+\.xml|tables\/table\d+\.xml|worksheets\/_rels\/sheet\d+\.xml\.rels|_rels\/workbook\.xml\.rels))$/.test(entry.name),
+        'NATIVE_CONTENT_UNSUPPORTED', 'Chart workbook contains unsupported active or linked parts.');
+      const data = await zip.file(entry.name).async('nodebuffer');
+      check(data.length === entry.uncompressed, 'INVALID_PACKAGE', 'Workbook expanded size mismatch.');
+      workbook.set(entry.name,data);
+      const doc = parseXml(data);
+      check(!/macroEnabled|vbaProject|oleObject/i.test(xml(doc)), 'NATIVE_CONTENT_UNSUPPORTED', 'Chart workbook has unsupported content types.');
+      check(!Array.from(doc.getElementsByTagName('*')).some(n=>['f','calculatedColumnFormula','totalsRowFormula','externalReference','definedName'].includes(n.localName)),
+        'NATIVE_CONTENT_UNSUPPORTED', 'Chart workbooks must contain static data, without formulas or external references.');
+    }
+    check(workbook.has('xl/workbook.xml') && workbook.has('[Content_Types].xml'), 'NATIVE_CONTENT_UNSUPPORTED', 'Invalid embedded chart workbook.');
+    for (const p of workbook.keys()) if (p.endsWith('.rels')) for (const r of rels(workbook, relationshipsSource(p))) {
+      check(!r.external && workbook.has(resolvePart(relationshipsSource(p),r.target)), 'NATIVE_EXTERNAL_CONTENT', 'Workbook relationships must resolve to internal static parts.');
     }
   }
 }
@@ -154,6 +186,51 @@ export async function writePackage(parts) {
   const zip = new JSZip();
   for (const [name, data] of parts) zip.file(name, data, { date: new Date('2000-01-01T00:00:00Z'), createFolders: false });
   return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+}
+
+/**
+ * 优化写包实现：复用源包未变动部件的压缩字节流，避免全量重新 DEFLATE；
+ * 对媒体文件（ppt/media/*）采用 STORE 策略，规避对二进制媒体重复压缩的 CPU 损耗。
+ * 若无 sourceBytes 或解析失败，优雅降级为标准 writePackage。
+ */
+export async function writePackageOptimized(sourceBytes, currentParts, sourceParts) {
+  if (!sourceBytes || !sourceParts) return writePackage(currentParts);
+  try {
+    const zip = await JSZip.loadAsync(sourceBytes, { createFolders: false });
+    const fixedDate = new Date('2000-01-01T00:00:00Z');
+
+    // 1. 清理在 currentParts 中已被移除的文件
+    for (const relativePath of Object.keys(zip.files)) {
+      // JSZip.remove(directory) recursively removes retained children too.
+      if (zip.files[relativePath]?.dir) continue;
+      if (!currentParts.has(relativePath)) {
+        zip.remove(relativePath);
+      }
+    }
+
+    // 2. 仅更新发生变更或新增的部件，媒体文件指定 STORE
+    for (const [name, data] of currentParts) {
+      const isMedia = name.startsWith('ppt/media/');
+      const origData = sourceParts.get(name);
+      const isChanged = !origData || !data.equals(origData);
+
+      if (isChanged) {
+        const options = { date: fixedDate, createFolders: false };
+        if (isMedia) options.compression = 'STORE';
+        zip.file(name, data, options);
+      } else if (isMedia) {
+        const existing = zip.file(name);
+        const date = existing?.date || fixedDate;
+        zip.file(name, data, { compression: 'STORE', date, createFolders: false });
+      }
+      // 未变动的 XML 和关系部件不调用 zip.file()，JSZip 自动复用原压缩数据流
+    }
+
+    return await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+  } catch {
+    // 容灾降级：若增量复用失败，回退至确定性的标准全量打包
+    return writePackage(currentParts);
+  }
 }
 
 export function setChild(parent, namespace, qualifiedName) {
