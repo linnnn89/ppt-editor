@@ -1,5 +1,10 @@
 # Editing workflow
 
+Preserve the source and save to a new path. Use inspected object references;
+never guess a missing target. Office requires authorization; reuse existing
+authorization rather than asking again. Report unavailable tools or unsupported
+operations without claiming work was performed.
+
 Default workflow: **file-mode batch drafting → returned page reports → targeted
 page refinement → final whole-deck check and visual review**. Prefer `mode:"file"`
 for supported edits. Use native-copy when a required capability or effective
