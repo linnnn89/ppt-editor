@@ -1,8 +1,14 @@
 # ppt-editor
 
+English | [简体中文](README.zh-CN.md)
+
 Create and edit PowerPoint presentations through an MCP server or command-line interface. The project supports batch changes to `.pptx` files, checks slide layouts, and uses Microsoft PowerPoint to render the saved result for review. Original files are preserved; edited presentations are saved to a new path.
 
-**Version:** `0.4.0-rc.4` — release candidate for Windows x64 and Node.js 24.
+**Version:** `0.4.0-rc.4` — release candidate.
+
+**Requires Windows x64 and Node.js 24.x on the computer running the MCP server.** The current package supports `>=24 <25` and does not bundle Node.js. Microsoft PowerPoint is required for native editing and rendering.
+
+[Installation](#installation-and-mcp-setup) · [Workflow](#recommended-workflow) · [Tools and examples](#tools-and-examples) · [Limitations](#limitations)
 
 ## Features
 
@@ -25,11 +31,27 @@ Rendering requires PowerPoint in either mode. File-mode editing can therefore us
 
 ## Installation and MCP setup
 
-Requirements:
+### Prerequisites
 
-- Windows x64 and Node.js 24.
-- Python and MSVC C++ build tools for the `winax` native module.
-- Microsoft PowerPoint for native editing, rendering and Office integration tests.
+Install these prerequisites on the computer that will run the server or CLI:
+
+| Component | Requirement | Used for |
+|---|---|---|
+| Operating system | Windows x64 | All installations, including file-mode usage |
+| Node.js | **24.x** (`>=24 <25`) | Running the MCP server, CLI and install script |
+| Native build tools | Python and MSVC C++ build tools | Compiling `winax` during `npm ci` |
+| Microsoft PowerPoint | Installed desktop application | Native editing, rendering and Office integration tests |
+
+Check Node before installing:
+
+```powershell
+node --version
+node -p "process.platform + ' ' + process.arch"
+```
+
+The output must be `v24.x.x` and `win32 x64`. Node 22 and Node 25 or later are outside the supported range. The install script checks the platform and Node major version, and stops if they do not match.
+
+### Install from source
 
 ```powershell
 git clone https://github.com/linnnn89/ppt-editor.git
@@ -37,11 +59,13 @@ cd ppt-editor
 npm ci
 ```
 
-The install script builds `winax` and runs a native-module smoke test. It uses Node 24.18.1 headers to avoid a known addon issue with the 24.19.0 headers; it does not replace the installed Node runtime. See [build-native.js](scripts/build-native.js) for the build configuration.
+`npm ci` installs project dependencies; it does not install Node.js, Python, MSVC or PowerPoint. This source installation builds the native module even if you plan to use only file-mode editing.
+
+The install script builds `winax` and runs a native-module smoke test. It uses Node 24.18.1 headers to avoid a known addon issue with the 24.19.0 headers; it does not replace the installed Node runtime or require that exact runtime patch version. See [build-native.js](scripts/build-native.js) for the build configuration.
 
 ### Connect Codex
 
-Add the following to the project's `.codex/config.toml`. Replace the Node executable and repository paths with the paths on your machine.
+Add the following to the project's `.codex/config.toml`. Replace the Node executable and repository paths with the paths on your machine. The `command` must point to a **Node.js 24.x executable**; a compatible Node in your terminal does not guarantee that this configured executable uses the same version.
 
 ```toml
 [mcp_servers.ppt_editor]
@@ -55,7 +79,9 @@ enabled = true
 
 Run the server directly with Node so package-manager output does not interfere with STDIO. Starting the server does not start PowerPoint.
 
-The [project Skill](skills/ppt-editor/SKILL.md) provides editing instructions for the agent. To make it discoverable in this project, run the following from the repository root. If the destination already exists, inspect it before making changes.
+### Add the agent Skill
+
+The [project Skill](skills/ppt-editor/SKILL.md) provides editing instructions for the agent; it does not install or configure the MCP server. To make it discoverable in this project, run the following from the repository root. If the destination already exists, inspect it before making changes.
 
 ```powershell
 New-Item -ItemType Directory -Path .agents/skills -Force | Out-Null
