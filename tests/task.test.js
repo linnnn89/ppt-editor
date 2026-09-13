@@ -5,8 +5,9 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fork } from 'node:child_process';
 import { buildDeck } from '../src/build.js';
-import { TaskHost, encodeTargetRef, decodeTargetRef, assertTaskDirBoundary } from '../src/task.js';
+import { TaskHost, FileLock, encodeTargetRef, decodeTargetRef, assertTaskDirBoundary } from '../src/task.js';
 import { readPackage } from '../src/ooxml.js';
+import { FileEngine } from '../src/file-engine.js';
 import { hash, writeJson, stableJson } from '../src/storage.js';
 
 const workDir = () => path.resolve('work/tests', randomUUID());
@@ -290,6 +291,54 @@ test('TaskHost handles idempotency and conflicts on operationId', async () => {
   assert.equal(status.status, 'active');
   assert.equal(status.operationReceipt.status, 'completed');
   assert.equal(status.operationReceipt.result.documentId, first.documentId);
+
+  const receipts = path.join(host.taskDir, 'receipts');
+  const invalidParams = { example: 'do not rerun' };
+  let unexpectedExecutions = 0;
+  for (const [operationId, content] of [
+    ['broken-receipt', '{"status":'],
+    ['unknown-receipt', JSON.stringify({ operationId: 'unknown-receipt', paramsHash: hash(stableJson(invalidParams)), status: 'unexpected' })]
+  ]) {
+    const receiptPath = path.join(receipts, `${operationId}.json`);
+    await fs.writeFile(receiptPath, content);
+    await assert.rejects(host.executeIdempotent(operationId, invalidParams, async () => { unexpectedExecutions++; }));
+    assert.equal(await fs.readFile(receiptPath, 'utf8'), content, 'Unreadable receipts must remain available for recovery.');
+  }
+  assert.equal(unexpectedExecutions, 0);
+
+  const missing = { ...openParams, path: path.join(root, 'missing.pptx'), operationId: 'failed-replay' };
+  await assert.rejects(host.open(missing), { code: 'SOURCE_NOT_FOUND' });
+  const failedPath = path.join(receipts, 'failed-replay.json');
+  const failedReceipt = await fs.readFile(failedPath);
+  await assert.rejects(host.open(missing), { code: 'SOURCE_NOT_FOUND' });
+  assert.deepEqual(await fs.readFile(failedPath), failedReceipt, 'Replaying a failure must not rewrite its original evidence.');
+
+  const inspected = await host.inspect({ documentId: first.documentId });
+  const target = inspected.objects.find(o => o.name === 'Title');
+  const request = { documentId: first.documentId, expectedRevision: 0, operationId: 'unconfirmed-receipt',
+    operations: [{ type: 'replace_text', targetRef: target.targetRef, search: 'Original Title', replacement: 'Applied Once', expectedMatches: 1 }] };
+  const receiptPath = path.join(receipts, 'unconfirmed-receipt.json');
+  const rename = fs.rename;
+  let injected = false;
+  try {
+    fs.rename = async (from, to) => {
+      if (to === receiptPath && JSON.parse(await fs.readFile(from, 'utf8')).status === 'completed') {
+        injected = true;
+        throw Object.assign(new Error('Injected completed receipt publication failure'), { code: 'EACCES' });
+      }
+      return rename(from, to);
+    };
+    await assert.rejects(host.apply(request), { code: 'OPERATION_RECEIPT_UNCONFIRMED' });
+  } finally { fs.rename = rename; }
+  assert(injected);
+  const after = await host.inspect({ documentId: first.documentId });
+  assert.equal(after.revision, 1);
+  assert.match(after.objects.find(o => o.name === 'Title').text, /Applied Once/);
+  const pendingReceipt = await fs.readFile(receiptPath);
+  assert.equal(JSON.parse(pendingReceipt).status, 'in_progress');
+  await assert.rejects(host.apply(request), { code: 'OPERATION_INTERRUPTED' });
+  assert.deepEqual(await fs.readFile(receiptPath), pendingReceipt);
+  assert.deepEqual(await fs.readFile(sourceFile), sourceBytes);
 });
 
 test('TaskHost hydrates session across separate instances and checks source existence', async () => {
@@ -338,6 +387,48 @@ test('TaskHost hydrates session across separate instances and checks source exis
     host2.open({ path: path.join(root, 'nonexistent.pptx'), mode: 'file', operationId: 'op_nonexistent' }),
     { code: 'SOURCE_NOT_FOUND' }
   );
+
+  // A durable checkpoint can precede a failed task-state write. Neither a warm
+  // host nor a new process may issue old-revision references to the new content.
+  const beforeFailure = await host2.inspect({ documentId: docId });
+  const target = beforeFailure.objects.find(o => o.name === 'Title');
+  const session = await host2.getSession(docId), metaPath = path.join(session.directory, 'meta.json');
+  const rename = fs.rename; let injected = false;
+  try {
+    fs.rename = async (from, to) => {
+      if (to === metaPath && !injected) {
+        injected = true;
+        throw Object.assign(new Error('Injected state publication failure'), { code: 'EACCES' });
+      }
+      return rename(from, to);
+    };
+    await assert.rejects(host2.apply({ documentId: docId, expectedRevision: 2, operationId: 'interrupted-state',
+      operations: [{ type: 'replace_text', targetRef: target.targetRef, search: 'Instance2 Edit', replacement: 'Checkpoint Only', expectedMatches: 1 }] }), { code: 'EACCES' });
+  } finally { fs.rename = rename; }
+  assert(injected);
+  const checkpointPath = path.join(session.engine.directory, 'revision.json');
+  const checkpoint = await fs.readFile(checkpointPath);
+  const restored = await FileEngine.restore(session.engine.directory);
+  assert.equal(restored.revision, 3);
+  assert.match(restored.inspect().objects.find(o => o.name === 'Title').text, /Checkpoint Only/);
+  const host3 = new TaskHost({ taskId, baseDir });
+  for (const host of [host2, host3]) {
+    await assert.rejects(host.inspect({ documentId: docId }), { code: 'FILE_STATE_MISMATCH' });
+  }
+  await assert.rejects(host3.apply({ documentId: docId, expectedRevision: 2, operationId: 'must-not-edit',
+    operations: [{ type: 'set_style', targetRef: target.targetRef, style: { bold: true } }] }), { code: 'FILE_STATE_MISMATCH' });
+  const blockedOutput = path.join(root, 'must-not-publish.pptx');
+  await assert.rejects(host3.commit({ documentId: docId, expectedRevision: 2, operationId: 'must-not-publish', outputPath: blockedOutput }), { code: 'FILE_STATE_MISMATCH' });
+  await assert.rejects(fs.access(blockedOutput), { code: 'ENOENT' });
+  const status = await host3.status({ operationId: 'interrupted-state' });
+  const document = status.documents.find(d => d.documentId === docId);
+  assert.equal(document.stateError.code, 'FILE_STATE_MISMATCH');
+  assert.equal(document.stateError.metadataRevision, 2);
+  assert.equal(document.stateError.checkpointRevision, 3);
+  assert(document.layout.pages.every(page => page.stale));
+  assert.equal(document.layout.finalWholeDeckCheck, 'required');
+  assert.deepEqual(await fs.readFile(checkpointPath), checkpoint);
+  assert.deepEqual(await fs.readFile(sourceFile), sourceBytes);
 });
 
 test('TaskHost preserves reviews, unclosed documents and task metadata across separate instances during finish', async () => {
@@ -510,7 +601,7 @@ test('Scenario 2: TaskHost enforces cross-process mutual exclusion, idempotency 
 
   // Helper 函数：启动一个就绪的独立 Node 子进程
   function spawnWorker() {
-    const child = fork(workerScript, [], { stdio: ['inherit', 'inherit', 'inherit', 'ipc'] });
+    const child = fork(workerScript, [], { windowsHide: true, stdio: ['inherit', 'inherit', 'inherit', 'ipc'] });
     return new Promise((resolve) => {
       child.on('message', msg => {
         if (msg.ready) resolve(child);
@@ -655,6 +746,65 @@ test('Scenario 2: TaskHost enforces cross-process mutual exclusion, idempotency 
     }),
     { code: 'OPERATION_INTERRUPTED' }
   );
+
+  // A delayed stale-lock read must not let its cleanup delete a newer owner.
+  const lockPath = path.join(root, 'stale-race.lock');
+  await writeJson(lockPath, { pid: 4294967294, created: '0', nonce: 'dead-owner' });
+  const originalRead = fs.readFile, originalUnlink = fs.unlink;
+  const readStale = Promise.withResolvers(), resumeRead = Promise.withResolvers();
+  const cleanupAttempt = Promise.withResolvers();
+  let paused = false, current, delayed;
+  fs.readFile = async (file, ...args) => {
+    const content = await originalRead(file, ...args);
+    if (file === lockPath && !paused) {
+      paused = true;
+      readStale.resolve();
+      await resumeRead.promise;
+    }
+    return content;
+  };
+  try {
+    delayed = FileLock.acquire(lockPath, { maxWaitMs: 3000 });
+    delayed.catch(() => {});
+    await readStale.promise;
+    current = await FileLock.acquire(lockPath);
+    fs.unlink = async (file, ...args) => {
+      try {
+        const result = await originalUnlink(file, ...args);
+        if (file === lockPath) cleanupAttempt.resolve(null);
+        return result;
+      } catch (error) {
+        if (file === lockPath) cleanupAttempt.resolve(error);
+        throw error;
+      }
+    };
+    resumeRead.resolve();
+    assert.ok(await cleanupAttempt.promise, 'Stale cleanup must not delete a live owner.');
+    assert.equal(JSON.parse(await originalRead(lockPath, 'utf8')).nonce, current.nonce);
+  } finally {
+    resumeRead.resolve();
+    fs.readFile = originalRead;
+    fs.unlink = originalUnlink;
+    await FileLock.release(current);
+    if (delayed) await FileLock.release(await delayed);
+  }
+
+  // Kernel ownership survives attempted deletion, then ends with its real child process.
+  const lockWorker = await spawnWorker();
+  const workerExit = new Promise(resolve => lockWorker.once('exit', resolve));
+  try {
+    const locked = new Promise(resolve => lockWorker.once('message', resolve));
+    lockWorker.send({ action: 'hold-lock', lockPath });
+    assert.equal((await locked).locked, true);
+    await assert.rejects(fs.unlink(lockPath));
+    await assert.rejects(FileLock.acquire(lockPath, { maxWaitMs: 120 }), { code: 'LOCK_TIMEOUT' });
+  } finally {
+    lockWorker.kill();
+    await workerExit;
+  }
+  const recovered = await FileLock.acquire(lockPath, { maxWaitMs: 3000 });
+  await FileLock.release(recovered);
+  await assert.rejects(fs.stat(lockPath), { code: 'ENOENT' });
 });
 
 test('TaskHost inspects and modifies slide background with revision integrity', async () => {

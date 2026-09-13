@@ -6,7 +6,7 @@ import { PptError, check } from './errors.js';
 import { FileEngine } from './file-engine.js';
 import { NativeHost, assertCleanupConfirmed } from './native-host.js';
 import { hash, stableJson, writeJson, readJson, atomicWrite, publishNew, exists } from './storage.js';
-import { createOwnedJob, restrictAccess, processIdentity } from './windows.js';
+import { createOwnedJob, createLockFile, restrictAccess, processIdentity } from './windows.js';
 import { buildDeck } from './build.js';
 import { readPackage, validatePackage } from './ooxml.js';
 import packageInfo from '../package.json' with { type: 'json' };
@@ -17,6 +17,12 @@ import { recordAudit, auditSummary, readOptional, summarizeNative, assessReview 
 import { reportProgress } from './progress.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function fileStateMismatch(meta, checkpointRevision) {
+  if (meta.revision === checkpointRevision) return undefined;
+  return { code: 'FILE_STATE_MISMATCH', metadataRevision: meta.revision, checkpointRevision,
+    outcome: 'outcome_unknown', nextAction: 'inspect_operation_receipt' };
+}
 
 /**
  * 严格校验 TaskId 是否为合法的 UUID 格式，杜绝路径穿越、绝对路径或非法字符。
@@ -50,7 +56,7 @@ export async function assertTaskDirBoundary(baseDir, taskDir, taskId) {
 }
 
 /**
- * 跨进程内核级原子文件锁管理器（基于 fs.open 'wx' 排他创建）
+ * 跨进程文件锁：在整个持有期保留禁止删除的内核句柄。
  */
 export class FileLock {
   /**
@@ -66,7 +72,6 @@ export class FileLock {
     while (true) {
       try {
         await fs.mkdir(path.dirname(lockPath), { recursive: true });
-        const handle = await fs.open(lockPath, 'wx', 0o600);
         const payload = JSON.stringify({
           pid: myPid,
           created: myCreated,
@@ -75,12 +80,11 @@ export class FileLock {
           acquiredAt: new Date().toISOString(),
           at: Date.now()
         });
-        await handle.writeFile(payload);
-        await handle.sync();
-        await handle.close();
-        return { lockPath, nonce };
+        const guard = createLockFile(lockPath, payload);
+        return { lockPath, nonce, guard };
       } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
+        // A delete-on-close file can briefly report access denied while a reader closes.
+        if (error.code !== 'EEXIST' && error.code !== 'EACCES') throw error;
 
         // 锁文件已存在，检测持有者进程生死
         try {
@@ -89,16 +93,13 @@ export class FileLock {
           const holderIdentity = processIdentity(data.pid);
           const isAlive = holderIdentity && holderIdentity.created === data.created;
           if (!isAlive) {
-            // 持有者进程已退出或 PID 被复用，属于崩溃残留锁，安全清理后重试
-            await fs.unlink(lockPath).catch(() => {});
-            continue;
+            // 兼容旧版残留锁；若已被新持有者替换，内核拒绝这次删除。
+            if (await fs.unlink(lockPath).then(() => true, () => false)) continue;
           }
-        } catch (readError) {
-          if (readError.code === 'ENOENT') continue;
-        }
+        } catch {}
 
         if (Date.now() >= deadline) {
-          throw new PptError('LOCK_TIMEOUT', `Timed out waiting for lock: ${path.basename(lockPath)}`, { lockPath, context });
+          throw new PptError('LOCK_TIMEOUT', `Timed out waiting for lock: ${path.basename(lockPath)}`, { lockPath, context, ...error.details });
         }
         await new Promise(r => setTimeout(r, retryIntervalMs));
       }
@@ -106,17 +107,10 @@ export class FileLock {
   }
 
   /**
-   * 安全释放锁：必须核验持有者 token（nonce），避免错误删除他人锁。
+   * 关闭持有的句柄，仅删除该句柄对应的锁文件。
    */
   static async release(lockHandle) {
-    if (!lockHandle || !lockHandle.lockPath || !lockHandle.nonce) return;
-    try {
-      const content = await fs.readFile(lockHandle.lockPath, 'utf8');
-      const data = JSON.parse(content);
-      if (data.nonce === lockHandle.nonce) {
-        await fs.unlink(lockHandle.lockPath).catch(() => {});
-      }
-    } catch {}
+    lockHandle?.guard.close();
   }
 }
 
@@ -308,6 +302,18 @@ export class TaskHost {
       throw new PptError('SESSION_UNUSABLE', 'Document session entered outcome_unknown state and is unusable.');
     }
 
+    const assertFileState = checkpointRevision => {
+      const mismatch = fileStateMismatch(meta, checkpointRevision);
+      check(!mismatch, 'FILE_STATE_MISMATCH',
+        'File checkpoint and document state disagree. Preserve the checkpoint and inspect the operation receipt before recovery.', mismatch);
+    };
+    if (meta.mode === 'file') {
+      // The engine manifest is committed before document metadata. Check it even
+      // for a warm session: publication failure must not mint old-revision refs.
+      const checkpoint = await readJson(path.join(docDir, 'engine', 'revision.json'));
+      assertFileState(checkpoint.revision);
+    }
+
     if (this.sessions.has(documentId)) {
       const session = this.sessions.get(documentId);
       if (session.closed) return null;
@@ -326,6 +332,7 @@ export class TaskHost {
     if (meta.mode === 'file') {
       const engineDir = path.join(docDir, 'engine');
       engine = await FileEngine.restore(engineDir);
+      assertFileState(engine.revision);
     } else if (meta.mode === 'native-copy') {
       // 原生文稿跨进程恢复：通过持久化检查点重新在原生执行器中打开
       const nativeHost = await this.ensureNativeHost();
@@ -376,11 +383,14 @@ export class TaskHost {
     // 1. 获取 operation 锁
     const opLock = await FileLock.acquire(opLockPath, { context: `op:${operationId}` });
     let docLock = null;
+    let receiptStarted = false, executionCompleted = false;
 
     try {
       // 检查是否已有完成回执（即使任务已完成，也允许按约定回放既有回执）
       if (await exists(receiptPath)) {
         const receipt = await readJson(receiptPath);
+        check(receipt && ['completed', 'failed', 'in_progress'].includes(receipt.status),
+          'OPERATION_RECEIPT_INVALID', 'The stored operation receipt is invalid. Preserve it and inspect durable state before recovery.', { operationId });
         const { layoutCheck, ...legacyParams } = rawParams;
         const legacyReplay = !receipt.receiptVersion && layoutCheck === true && receipt.paramsHash === hash(stableJson(legacyParams));
         check(receipt.paramsHash === paramsHash || legacyReplay, 'IDEMPOTENCY_CONFLICT', 'Operation ID was already used with different parameters.', { operationId });
@@ -418,8 +428,10 @@ export class TaskHost {
         pid: process.pid,
         startedAt: new Date().toISOString()
       });
+      receiptStarted = true;
 
       const result = await executeFn();
+      executionCompleted = true;
 
       // 记录 completed 回执
       await writeJson(receiptPath, {
@@ -433,7 +445,13 @@ export class TaskHost {
 
       return result;
     } catch (error) {
-      if (error.code !== 'IDEMPOTENCY_CONFLICT' && error.code !== 'OPERATION_INTERRUPTED') {
+      if (executionCompleted) {
+        // Keep in_progress: publishing a receipt failure does not undo the edit.
+        throw new PptError('OPERATION_RECEIPT_UNCONFIRMED',
+          'The operation returned, but its completed receipt could not be persisted. Inspect durable state before recovery.',
+          { operationId, outcome: 'outcome_unknown', nextAction: 'inspect_operation_receipt', cause: error.code || 'UNKNOWN_ERROR' });
+      }
+      if (receiptStarted) {
         await writeJson(receiptPath, {
           receiptVersion: 2,
           operationId,
@@ -1392,9 +1410,13 @@ export class TaskHost {
       check(UUID_REGEX.test(binding.documentId), 'INVALID_BINDING', 'Document binding ID is invalid.');
       const meta = await readOptional(path.join(taskDir, 'documents', binding.documentId, 'meta.json'));
       const audit = await readOptional(path.join(taskDir, 'layout-audits', `${binding.documentId}.json`));
+      const checkpoint = meta?.mode === 'file' && !meta.closed
+        ? await readOptional(path.join(taskDir, 'documents', binding.documentId, 'engine', 'revision.json')) : null;
+      const stateError = checkpoint ? fileStateMismatch(meta, checkpoint.revision) : undefined;
       return { documentId: binding.documentId, mode: binding.mode, closed: meta?.closed ?? true, historical: !meta,
         revision: meta?.revision ?? audit?.revision, generation: meta?.generation ?? audit?.generation,
-        layout: auditSummary(audit, meta?.revision ?? audit?.revision, meta?.generation ?? audit?.generation) };
+        ...(stateError ? { stateError } : {}),
+        layout: auditSummary(audit, checkpoint?.revision ?? meta?.revision ?? audit?.revision, meta?.generation ?? audit?.generation) };
     }));
     return {
       ...taskInfo, bindings, documents,

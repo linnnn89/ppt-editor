@@ -4,7 +4,7 @@
 
 通过 MCP 服务或命令行创建、编辑 PowerPoint 演示文稿。支持批量修改 `.pptx` 文件、检查幻灯片布局，并使用 Microsoft PowerPoint 渲染保存后的文件以供审查。原文件始终保留，修改结果另存到新路径。
 
-**版本：** `0.4.0-rc.7`，候选发布版。
+**版本：** `0.4.0-rc.8`，候选发布版。
 
 **运行 MCP 服务的电脑必须安装 Windows x64 和 Node.js 24.x。** 当前支持范围为 `>=24 <25`，项目不内置 Node.js。原生编辑和渲染还需要安装 Microsoft PowerPoint。
 
@@ -144,6 +144,9 @@ MCP 支持取消处理、可选进度通知和阶段计时；文件检查点会�
 
 重叠声明、版本处理和最终审查的详细规则见 [Skill](skills/ppt-editor/SKILL.md)。
 
+支持 JavaScript 工具编排的客户端可使用[代码编排手册](skills/ppt-editor/references/code-mode.md)：
+完整回执和对象引用保存在代码状态中，模型只读取一份摘要；结果不确定时保留原请求用于核对与恢复。
+
 ## 工具与示例
 
 MCP 服务提供 14 个工具。CLI 提供同名命令，去掉 `ppt_` 前缀即可。
@@ -223,6 +226,8 @@ node src/cli.js finish --task $task.taskId --reviews '[]'
 |---|---|
 | `REVISION_MISMATCH` 或引用过期 | 检查当前文稿，使用最新引用重新构造编辑请求。 |
 | 响应缺失或结果不确定 | 使用 operationId 查询 `ppt_status`。先检查操作记录，再决定是否以相同 ID 重试相同请求。 |
+| `FILE_STATE_MISMATCH` | 停止编辑和发布。查看状态中的两个版本号，保留检查点和原操作回执。 |
+| `OPERATION_RECEIPT_UNCONFIRMED` | 编辑可能已经保存。保留待确认回执并检查持久状态；此时禁止自动重复执行。 |
 | `NATIVE_BUSY` | 等待持有 Office 使用权的任务结束，不要关闭其他任务的 Office 会话。 |
 | `CLEANUP_UNCONFIRMED` | 检查状态和保留的恢复记录，不要删除记录或假定清理已经成功。 |
 | `acceptance:incomplete` | 输出尚未通过验收。资源清理与最终审查是两项独立结果。 |

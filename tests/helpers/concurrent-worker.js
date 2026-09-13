@@ -1,8 +1,15 @@
-import { TaskHost } from "../../src/task.js";
+import { FileLock, TaskHost } from "../../src/task.js";
+
+let heldLock;
 
 process.on("message", async msg => {
   if (msg.action === "init") {
     process.send({ ready: true });
+    return;
+  }
+  if (msg.action === "hold-lock") {
+    heldLock = await FileLock.acquire(msg.lockPath);
+    process.send({ locked: true, nonce: heldLock.nonce });
     return;
   }
   if (msg.action === "apply") {

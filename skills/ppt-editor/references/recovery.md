@@ -42,6 +42,12 @@ lease; NATIVE_BUSY means preserve both tasks and wait for the owning task to fin
 
 If an operation response is missing, inspect the persisted operation receipt and current document revision before retrying. A retry of the same request uses the same operationId. A failed layout audit does not undo a completed edit. Do not regenerate or repeat the edit with a new ID just to obtain a successful check.
 
+On `OPERATION_RECEIPT_UNCONFIRMED`, the operation returned but its completed
+receipt could not be saved. The retained `in_progress` receipt blocks automatic
+re-execution. Inspect the current revision and output before recovery; a receipt
+write failure does not prove that the edit failed. Malformed or invalid receipts
+are preserved and block execution. Do not replace them with a new operation ID.
+
 When diagnostics report `queuedRequestCancellation:true`, cancelled MCP requests
 are skipped if their handler has not started. Already executing operations retain
 their normal persistence and recovery behavior. Cancelling the caller's wait does
@@ -55,6 +61,13 @@ updates bypass the 250 ms within-stage throttle. Notifications stop when the
 caller cancels or the request finishes. Confirm actual client UI visibility before
 claiming progress is displayed. A completed request still requires inspection of
 its business result, layout report and acceptance status.
+
+On `FILE_STATE_MISMATCH`, the durable file checkpoint and document metadata have
+different revisions. A previous edit may already have changed checkpoint bytes.
+Stop new edits and publication, retain the task and operation IDs, and inspect
+`ppt_status.documents[].stateError` with the original operation receipt. Status
+reports both revisions and invalidates older layout evidence. Do not change the
+metadata revision or delete checkpoint files merely to bypass this guard.
 
 Checkpoint-part reuse verifies existing content before skipping a write. On
 `CHECKPOINT_CORRUPT`, preserve the part and revision manifest for inspection;
