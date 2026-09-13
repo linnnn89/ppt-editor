@@ -110,12 +110,14 @@ image paths alone are not visual approval.
 
 ## Benchmarking
 
-For MCP calls, `_meta.pptEditorTiming` reports queue time, execution time and
-accumulated wall-clock intervals between stage events. These diagnostics belong
-to the current call, including receipt replays; they do not rewrite durable
-receipts or measure model thinking time. Compare complete workflows as well as
-individual phases before claiming a speed improvement. Verified checkpoint-part
-reuse reduces repeated writes, not necessarily the whole workflow by that ratio.
+For MCP calls, response `_meta.pptEditorTiming` provides `queueMs`, execution
+`elapsedMs` and accumulated `stages[].elapsedMs`. These are wall-clock intervals
+between observed stages, not CPU profiles or model thinking time. Timing belongs
+to the current call, including receipt replay; it does not alter business results
+or durable receipts. CLI JSON output remains unchanged. Compare complete workflows
+as well as individual phases before claiming a speed improvement. Verified
+checkpoint-part reuse reduces repeated writes, not necessarily the whole workflow
+by that ratio.
 
 When comparing workflows, freeze the input, target changes and acceptance criteria
 before execution. Record actual request/response ordering and measured time; keep
