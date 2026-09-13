@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 Create and edit PowerPoint presentations through an MCP server or command-line interface. The project supports batch changes to `.pptx` files, checks slide layouts, and uses Microsoft PowerPoint to render the saved result for review. Original files are preserved; edited presentations are saved to a new path.
 
-**Version:** `0.4.0-rc.4` — release candidate.
+**Version:** `0.4.0-rc.7` — release candidate.
 
 **Requires Windows x64 and Node.js 24.x on the computer running the MCP server.** The current package supports `>=24 <25` and does not bundle Node.js. Microsoft PowerPoint is required for native editing and rendering.
 
@@ -79,6 +79,8 @@ enabled = true
 
 Run the server directly with Node so package-manager output does not interfere with STDIO. Starting the server does not start PowerPoint.
 
+The project configuration applies within that project. To make the server available across projects, use the same entry in your user `~/.codex/config.toml`. Installing the Skill alone does not register the server.
+
 ### Add the agent Skill
 
 The [project Skill](skills/ppt-editor/SKILL.md) provides editing instructions for the agent; it does not install or configure the MCP server. To make it discoverable in this project, run the following from the repository root. If the destination already exists, inspect it before making changes.
@@ -99,6 +101,18 @@ Refresh the MCP connection, then call `ppt_diagnose` to check the running versio
 3. **Review problems when they occur.** Render and inspect a slide immediately if the report or content suggests unintended overlap, objects outside the page or clipped text. Fix confirmed problems and check the affected slide again before continuing. Do not take a screenshot after every ordinary edit. Only declare an overlap intentional when the design supports that decision.
 4. **Keep repairs focused.** Query the affected slide with fresh references. Several known, independent fixes may share a batch. Reuse current check results instead of repeating the same validation or loading the entire deck again. Keep unresolved and stale results visible in the worklist.
 5. **Review the final output.** Commit to a new path, then call `ppt_render` with the returned `reviewId`, `layoutCheck:true` and `detail:"summary"`. This combines the final whole-deck layout check with the readback used for rendering. Inspect every final page, using contact sheets and detailed views as needed. After further edits, commit again and review the new output. Finish with `requireAccepted:true` only when the checks and visual review are complete.
+
+Summary layout reports return the pending-page list once, in `layoutAudit.pendingSlides`; full responses and saved operation receipts retain their existing format. When native review is followed by file-mode edits, unchanged pages keep their original evidence and coverage. Changes to page dependencies or generation invalidate that evidence; file checks do not establish native text-fit coverage.
+
+Each page reports `coverage.textFitDetails`: `measured` and `unmeasured` text-object counts, with reasons such as rotated text, group children or missing native readback. Accumulated coverage counts current page evidence only; `unknownPageCount` identifies stale pages or older records without these counters. A geometry result of `clear` does not mean every text object was measured.
+
+MCP requests cancelled while still queued are skipped before execution. Once an operation has started, cancelling the caller's wait does not interrupt persistence or roll back the edit. Check `ppt_status` with its `operationId` before retrying, and reuse the same ID for the same request.
+
+Clients that send `_meta.progressToken` receive request-bound stages, slide/operation counts and elapsed time. Repeated updates within a stage are limited to one per 250 ms, with stage changes and completion reported immediately. The protocol progress value is an increasing event number, not a completion percentage. Notifications stop after cancellation or completion; receiving them does not prove the client UI displays them.
+
+MCP response `_meta.pptEditorTiming` contains `queueMs`, execution `elapsedMs` and accumulated `stages[].elapsedMs`. These are wall-clock intervals between observed stages, not CPU profiles; receipt replay measures the replay request. Timing metadata does not alter business results or durable receipts. CLI JSON output remains unchanged.
+
+File checkpoints reuse already stored parts only after verifying their content hash. A corrupt existing part fails with `CHECKPOINT_CORRUPT` and is preserved for inspection; the next revision is not committed. Missing parts are written atomically, followed by the revision manifest.
 
 `screenshotRequiredNow` currently identifies overlap reports; a false value does not rule out other visual problems. Code checks cannot determine design intent or fully assess readability. A generated image is not evidence that someone has inspected it.
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0-rc.7 (release candidate)
+
+- Reuse existing content-addressed checkpoint parts after verifying their SHA-256. New parts and revision manifests retain atomic writes; corrupt existing parts fail without overwriting recovery evidence or advancing the revision.
+- Forward request-bound native stages, slide/operation counts and elapsed time through opt-in MCP progress notifications. Throttle repeated stage updates, keep progress monotonic, and stop notifications on cancellation or completion without interrupting an already executing edit.
+- Return queue and stage timings in MCP response `_meta.pptEditorTiming`, keeping business results and saved operation receipts unchanged. Diagnostics expose `checkpointPartReuse`, `progressNotifications` and `requestStageTimings`. Client UI display requires separate verification.
+
+## 0.4.0-rc.6 (release candidate)
+
+- Skip cancelled MCP requests before their queued handler starts. Operations already executing retain their normal persistence and recovery behavior; cancelling the caller's wait does not roll back an edit. Query the operation receipt before retrying.
+- Report measured and unmeasured text-object counts and reasons per page. Accumulated coverage excludes stale measurements and reports unknown page counts for stale or older evidence without counters. Layout and final visual acceptance requirements remain unchanged.
+- Expose `queuedRequestCancellation` and `pageTextMeasurementCoverage` in diagnostics. Align package and README versions, and have Skill references verify the running version against disk instead of naming a fixed candidate version.
+
+## 0.4.0-rc.5 (release candidate)
+
+- Remove the duplicate pending-page list from summary layout responses. Full responses and previously saved operation receipts keep their existing shape.
+- Preserve unchanged page evidence when a file session switches from native readback to file checks, retaining its original source, coverage and issues. Dependency and generation changes still invalidate affected evidence; final whole-deck review remains required after edits.
+- Limit file-edit preflight indexing to target pages and reuse the post-edit snapshot for automatic layout checks. Keep whole-document state hashes, locked checkpoint recovery and package validation.
+
 ## 0.4.0-rc.4 (release candidate)
 
 - Document the default file-mode batch workflow, page-level refinement, immediate visual exceptions, actual-response ordering and final committed-output review in the Skill and README.

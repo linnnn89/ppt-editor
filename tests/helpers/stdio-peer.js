@@ -11,11 +11,13 @@ export async function startStdioPeer(baseDir, taskId) {
   let sequence = 0;
   let stderr = '';
   const pending = new Map();
+  const progress = [];
   child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-3000); });
   const lines = createInterface({ input: child.stdout });
   lines.on('line', line => {
     let message;
     try { message = JSON.parse(line); } catch { return; }
+    if (message.method === 'notifications/progress') { progress.push(message.params); return; }
     const waiter = pending.get(message.id);
     if (!waiter) return;
     pending.delete(message.id);
@@ -56,14 +58,15 @@ export async function startStdioPeer(baseDir, taskId) {
   try {
     const initialized = await request('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'ppt-eof-regression', version: '1.0.0' } });
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
-    const call = async (name, args = {}) => {
-      const result = await request('tools/call', { name, arguments: args });
+    const call = async (name, args = {}, progressToken) => {
+      const result = await request('tools/call', { name, arguments: args,
+        ...(progressToken !== undefined ? { _meta: { progressToken } } : {}) });
       if (result.isError) {
         const error = JSON.parse(result.content[0].text);
         throw Object.assign(new Error(error.error), { code: error.code, details: error.details });
       }
       return JSON.parse(result.content[0].text);
     };
-    return { child, initialized, request, call, endInput, stop };
+    return { child, initialized, request, call, progress, endInput, stop };
   } catch (error) { await stop(); throw error; }
 }

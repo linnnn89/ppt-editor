@@ -60,8 +60,12 @@ pages, use the previous output as templatePath with a fresh contentDeck/task.
 Animations and unsupported cross-page links are rejected. A separate advanced
 fixture verifies chart workbook and SmartArt data preservation through composition;
 this does not cover every imported chart/diagram or linked data source.
-Use ppt_diagnose to verify version 0.4.0-rc.4 and templateComposition capability;
-refresh the MCP client if it does not expose the current 14 tools.
+Use `ppt_diagnose` to verify that `version` matches `diskVersion`,
+`restartRequired` is false, and `templateComposition` is available. Current
+diagnostics also expose `queuedRequestCancellation` and `pageTextMeasurementCoverage`.
+`checkpointPartReuse:"sha256-verified"`, `progressNotifications:true` and
+`requestStageTimings:true` identify verified part reuse and request progress support.
+Refresh the MCP client if its version, capabilities or 14-tool list is outdated.
 
 ## Charts and relayout
 

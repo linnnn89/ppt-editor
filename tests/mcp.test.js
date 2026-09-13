@@ -9,8 +9,147 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { createPptMcpServer } from '../src/mcp.js';
 import { buildDeck } from '../src/build.js';
 import { readPackage } from '../src/ooxml.js';
+import { TaskHost } from '../src/task.js';
+import { FileEngine } from '../src/file-engine.js';
+import { currentProgress, reportProgress } from '../src/progress.js';
 
 const workDir = () => path.resolve('work/tests/mcp', randomUUID());
+
+test('MCP progress is bounded, request-scoped and stops on cancellation, failure or completion', { timeout: 15000 }, async () => {
+  const host = new TaskHost({ baseDir: workDir() });
+  const started = Promise.withResolvers(), release = Promise.withResolvers(), cancelled = Promise.withResolvers();
+  let calls = 0, lateReport;
+  host.diagnose = async () => {
+    calls++;
+    if (calls === 1) {
+      lateReport = currentProgress();
+      for (let completed = 0; completed <= 40; completed++) reportProgress('saving-checkpoint', { completed, total: 100, unit: 'parts' });
+      started.resolve(); await release.promise;
+    } else {
+      lateReport?.({ stage: 'late-previous-request' });
+      reportProgress('rendering-slides', { completed: 0, total: 2, unit: 'slides' });
+      reportProgress('rendering-slides', { completed: 2, total: 2, unit: 'slides' });
+      if (calls === 3) throw Error('synthetic progress failure');
+    }
+    return { status: 'ok' };
+  };
+  const instance = createPptMcpServer({ taskHost: host });
+  const [ct, st] = ClientInMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'progress-regression', version: '1.0.0' });
+  const firstEvents = [], secondEvents = [], wireEvents = [], controller = new AbortController();
+  let firstOutcome, second;
+  try {
+    await instance.server.connect(st); await client.connect(ct);
+    const clientDispatch = ct.onmessage, serverDispatch = st.onmessage;
+    ct.onmessage = (message, ...rest) => {
+      if (message.method === 'notifications/progress') wireEvents.push(message.params);
+      clientDispatch(message, ...rest);
+    };
+    st.onmessage = (message, ...rest) => {
+      serverDispatch(message, ...rest);
+      if (message.method === 'notifications/cancelled') cancelled.resolve();
+    };
+    firstOutcome = client.callTool({ name: 'ppt_diagnose', arguments: {} }, { signal: controller.signal, onprogress: event => firstEvents.push(event) })
+      .then(value => ({ value }), error => ({ error }));
+    await started.promise; await new Promise(resolve => setImmediate(resolve));
+    assert(firstEvents.some(e => e.message.includes('saving checkpoint')));
+    assert(firstEvents.length < 10, 'Rapid updates in one stage must be rate limited');
+    second = client.callTool({ name: 'ppt_diagnose', arguments: {} }, { onprogress: event => secondEvents.push(event) });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(secondEvents.length, 0, 'Queued requests do not inherit the active request progress');
+    controller.abort(Error('cancel progress request')); await cancelled.promise;
+    assert.match((await firstOutcome).error.message, /cancel progress request/);
+    const countAtCancel = firstEvents.length;
+    lateReport({ stage: 'after-cancellation' }); release.resolve();
+    const result = await second;
+    assert.equal(firstEvents.length, countAtCancel);
+    assert.deepEqual(result.structuredContent, { status: 'ok' });
+    assert(secondEvents.some(e => e.message.includes('2/2 slides')));
+    assert(secondEvents.at(-1).message.includes('completed'));
+    assert(secondEvents.every((e, i) => !i || e.progress > secondEvents[i - 1].progress));
+    assert(!wireEvents.some(e => /late previous|after cancellation/.test(e.message)));
+    const timing = result._meta.pptEditorTiming;
+    assert(timing.elapsedMs >= 0 && timing.queueMs >= 0);
+    assert(timing.stages.some(s => s.stage === 'rendering-slides' && s.elapsedMs >= 0));
+    const failedEvents = [];
+    const failed = await client.callTool({ name: 'ppt_diagnose', arguments: {} }, { onprogress: event => failedEvents.push(event) });
+    assert.equal(failed.isError, true); assert(failedEvents.at(-1).message.includes('failed'));
+    const beforeSilent = wireEvents.length;
+    await client.callTool({ name: 'ppt_diagnose', arguments: {} });
+    lateReport({ stage: 'after-completion' }); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(wireEvents.length, beforeSilent, 'Opt-out requests and late callbacks do not emit progress');
+  } finally {
+    controller.abort(Error('cancel progress request')); release.resolve();
+    await firstOutcome; await second?.catch(() => {});
+    await instance.cleanup(); await client.close(); await instance.server.close();
+  }
+});
+
+test('MCP cancellation skips queued edits but drains started edits to a durable receipt', { timeout: 15000 }, async () => {
+  const host = new TaskHost({ baseDir: workDir() });
+  host.ensureNativeHost = async () => { throw Error('Cancellation regression must not start Office'); };
+  const instance = createPptMcpServer({ taskHost: host });
+  const [ct, st] = ClientInMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'cancellation-regression', version: '1.0.0' });
+  const blocked = Promise.withResolvers(), releaseQueue = Promise.withResolvers();
+  const queued = Promise.withResolvers(), started = Promise.withResolvers(), releaseEdit = Promise.withResolvers();
+  let cancellation = Promise.withResolvers();
+  const call = async (name, args = {}) => {
+    const result = await client.callTool({ name, arguments: args });
+    assert.ok(!result.isError, result.content[0].text);
+    return result.structuredContent;
+  };
+  try {
+    await instance.server.connect(st); await client.connect(ct);
+    const dispatch = st.onmessage;
+    st.onmessage = (message, ...rest) => {
+      dispatch(message, ...rest);
+      if (message.method === 'tools/call' && message.params.arguments?.operationId === 'cancel-queued') queued.resolve();
+      if (message.method === 'notifications/cancelled') cancellation.resolve();
+    };
+    const { documentId } = await call('ppt_build', { operationId: 'build', deck: { slides: [{ items: [
+      { type: 'text', name: 'Heading', text: 'Before cancellation', left: 40, top: 40, width: 500, height: 60 }
+    ] }] } });
+    const session = await host.getSession(documentId), original = await fs.readFile(session.originalPath);
+    const targetRef = (await call('ppt_inspect', { documentId })).objects.find(o => o.name === 'Heading').targetRef;
+    const edit = { documentId, expectedRevision: 0, operations: [
+      { type: 'replace_text', targetRef, search: 'Before cancellation', replacement: 'After cancellation', expectedMatches: 1 }
+    ] };
+    host.diagnose = async () => { blocked.resolve(); await releaseQueue.promise; return { status: 'ok' }; };
+    const blockingCall = call('ppt_diagnose'); await blocked.promise;
+    const queuedController = new AbortController();
+    const queuedCancelled = assert.rejects(client.callTool({ name: 'ppt_apply', arguments: { ...edit, operationId: 'cancel-queued' } },
+      { signal: queuedController.signal }), /cancel queued edit/);
+    await queued.promise; await new Promise(resolve => setImmediate(resolve));
+    queuedController.abort(new Error('cancel queued edit')); await queuedCancelled; await cancellation.promise;
+    releaseQueue.resolve(); await blockingCall;
+    const unchanged = await call('ppt_inspect', { documentId });
+    assert.equal(unchanged.revision, 0);
+    assert.equal(unchanged.objects.find(o => o.name === 'Heading').text, 'Before cancellation');
+    await assert.rejects(fs.readFile(path.join(host.taskDir, 'receipts', 'cancel-queued.json')), { code: 'ENOENT' });
+
+    const apply = host.apply.bind(host);
+    host.apply = async args => { started.resolve(); await releaseEdit.promise; return apply(args); };
+    cancellation = Promise.withResolvers();
+    const startedController = new AbortController();
+    const startedCancelled = assert.rejects(client.callTool({ name: 'ppt_apply', arguments: { ...edit, operationId: 'cancel-started' } },
+      { signal: startedController.signal }), /cancel started edit/);
+    await started.promise;
+    startedController.abort(new Error('cancel started edit')); await startedCancelled; await cancellation.promise;
+    releaseEdit.resolve();
+    const completed = await call('ppt_status', { operationId: 'cancel-started' });
+    assert.equal(completed.operationReceipt.status, 'completed');
+    assert.equal(completed.operationReceipt.result.revision, 1);
+    const persisted = await FileEngine.restore(path.join(host.taskDir, 'documents', documentId, 'engine'));
+    assert.equal(persisted.revision, 1);
+    assert.equal(persisted.inspect().objects.find(o => o.name === 'Heading').text, 'After cancellation');
+    assert.deepEqual(await fs.readFile(session.originalPath), original);
+    await call('ppt_finish');
+  } finally {
+    releaseQueue.resolve(); releaseEdit.resolve();
+    await instance.cleanup(); await client.close(); await instance.server.close();
+  }
+});
 
 test('MCP native preflight preserves the session for editing, output readback and clean exit', { skip: process.platform !== 'win32', timeout: 120000 }, async () => {
   const root = workDir();
@@ -371,6 +510,15 @@ test('MCP Client connects to standalone MCP server process via real StdioClientT
     assert.equal(diagnoseRes.isError, undefined);
     const diag = JSON.parse(diagnoseRes.content[0].text);
     assert.equal(diag.status, 'ok');
+    const packageVersion = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
+    assert.equal(diag.version, packageVersion);
+    assert.equal(diag.diskVersion, packageVersion);
+    assert.equal(diag.restartRequired, false);
+    assert.equal(diag.capabilities.queuedRequestCancellation, true);
+    assert.equal(diag.capabilities.pageTextMeasurementCoverage, true);
+    assert.equal(diag.capabilities.checkpointPartReuse, 'sha256-verified');
+    assert.equal(diag.capabilities.progressNotifications, true);
+    assert.equal(diag.capabilities.requestStageTimings, true);
     assert.ok(diag.taskId);
     assert.equal(diag.closed, false);
 

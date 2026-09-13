@@ -3,6 +3,7 @@ import path from 'node:path';
 import { check } from './errors.js';
 import { hash, stableJson, writeJson, readJson, atomicWrite } from './storage.js';
 import { advancedObject } from './advanced-objects.js';
+import { reportProgress } from './progress.js';
 import { NS, child, children, descendants, parseXml, xml, rels, relationshipsPath, resolvePart, setChild, readPackage, writePackage, writePackageOptimized, validatePackage } from './ooxml.js';
 
 const PT = 12700;
@@ -220,6 +221,7 @@ export class FileEngine {
   constructor(directory, sourceBytes, parts, revision = 0) { this.directory = directory; this.sourceBytes = sourceBytes; this.sourceParts = parts; this.parts = new Map(parts); this.revision = revision; }
 
   static async create(directory, bytes) {
+    reportProgress('reading-package');
     const parts = await readPackage(bytes);
     const engine = new FileEngine(directory, bytes, parts);
     await atomicWrite(path.join(directory, 'source.pptx'), bytes);
@@ -227,6 +229,7 @@ export class FileEngine {
   }
 
   static async restore(directory) {
+    reportProgress('loading-checkpoint');
     const bytes = await fs.readFile(path.join(directory, 'source.pptx'));
     const meta = await readJson(path.join(directory, 'revision.json'));
     check(hash(bytes) === meta.sourceHash, 'CHECKPOINT_CORRUPT', 'Source snapshot hash mismatch.');
@@ -248,13 +251,19 @@ export class FileEngine {
   }
 
   prepare(operations) {
-    const baseline = new Map(this.inspect().objects.map(o => [o.key, o])), candidate = new Map(this.parts), documents = new Map(), changes = [];
+    reportProgress('checking-edit-targets');
+    // Scope by the canonical key, including notes/background keys and callers
+    // that supply only key + fingerprint. Target identity is still checked below.
+    const slideIds = new Set(operations.map(op => Number(op.target.key.split(':')[1])));
+    const slides = this.inspect({ slides: [] }).slides.filter(s => slideIds.has(s.slideId)).map(s => s.slide);
+    const baseline = new Map(this.inspect({ slides }).objects.map(o => [o.key, o])), candidate = new Map(this.parts), documents = new Map(), changes = [];
     for (const op of operations) {
       const item = baseline.get(op.target.key);
       check(item && item.fingerprint === op.target.fingerprint, 'TARGET_CHANGED', 'Target changed since inspection.');
       check(item.capabilities.includes(op.type), 'OPERATION_UNSUPPORTED', 'Operation is not supported on this object.', { type: op.type, kind: item.kind });
     }
-    for (const op of operations) {
+    for (const [index, op] of operations.entries()) {
+      reportProgress('preparing-edits', { completed: index, total: operations.length, unit: 'operations' });
       const item = baseline.get(op.target.key);
       if (!documents.has(item.part)) documents.set(item.part, parseXml(candidate.get(item.part), item.part));
       const doc = documents.get(item.part);
@@ -288,7 +297,9 @@ export class FileEngine {
       if (op.type === 'set_table_cell') setCell(descendants(shape, NS.a, 'tbl')[0], op);
       changes.push({ type: op.type, key: item.key, ...detail });
     }
+    reportProgress('preparing-edits', { completed: operations.length, total: operations.length, unit: 'operations' });
     for (const [name, doc] of documents) candidate.set(name, Buffer.from(xml(doc)));
+    reportProgress('checking-package');
     validatePackage(candidate);
     return { candidate, changes };
   }
@@ -304,20 +315,33 @@ export class FileEngine {
     const previous = this.parts, revision = this.revision;
     this.parts = prepared.candidate; this.revision++;
     try { await this.persist(); } catch (error) { this.parts = previous; this.revision = revision; throw error; }
-    return { outcome: 'completed', durable: true, revision: this.revision, changes: prepared.changes, stateHash: hash(stableJson(this.inspect().objects.map(o => [o.key, o.fingerprint]))) };
+    const snapshot = this.inspect();
+    return { outcome: 'completed', durable: true, revision: this.revision, changes: prepared.changes,
+      stateHash: hash(stableJson(snapshot.objects.map(o => [o.key, o.fingerprint]))), snapshot };
   }
 
   async persist() {
     const overlay = {};
-    for (const [name, bytes] of this.parts) {
-      if (this.sourceParts.has(name) && bytes.equals(this.sourceParts.get(name))) continue;
+    const changed = [...this.parts].filter(([name, bytes]) => !this.sourceParts.has(name) || !bytes.equals(this.sourceParts.get(name)));
+    let completed = 0;
+    reportProgress('saving-checkpoint', { completed, total: changed.length, unit: 'parts' });
+    for (const [name, bytes] of changed) {
       const sha256 = hash(bytes), file = `${sha256}.part`;
-      await atomicWrite(path.join(this.directory, 'parts', file), bytes); overlay[name] = { file, sha256 };
+      const destination = path.join(this.directory, 'parts', file);
+      try {
+        check(hash(await fs.readFile(destination)) === sha256, 'CHECKPOINT_CORRUPT', 'Existing checkpoint part hash mismatch.', { part: name });
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        await atomicWrite(destination, bytes);
+      }
+      overlay[name] = { file, sha256 };
+      reportProgress('saving-checkpoint', { completed: ++completed, total: changed.length, unit: 'parts' });
     }
     await writeJson(path.join(this.directory, 'revision.json'), { revision: this.revision, sourceHash: hash(this.sourceBytes), overlay });
   }
 
   async bytes() {
+    reportProgress('serializing-output');
     if (this.sourceBytes && this.sourceParts) {
       return writePackageOptimized(this.sourceBytes, this.parts, this.sourceParts);
     }

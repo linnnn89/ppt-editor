@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { hash, stableJson, readJson, writeJson } from './storage.js';
 import { layoutPageHashes } from './file-engine.js';
-import { auditLayout } from './layout-audit.js';
+import { auditLayout, summarizeLayoutCoverage } from './layout-audit.js';
 
 export const readOptional = file => readJson(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
 
@@ -9,7 +9,7 @@ export function auditSummary(record, revision = record?.revision, generation = r
   if (!record) return { status: 'not_checked', nextAction: 'check_layout', pages: [], finalWholeDeckCheck: 'required' };
   const sameRevision = record.revision === revision && record.generation === generation;
   const pages = record.pages.map(p => ({ slide: p.slide, status: p.status,
-    stale: !sameRevision || p.stale, counts: p.counts, checkedRevision: p.checkedRevision }));
+    stale: !sameRevision || p.stale, counts: p.counts, checkedRevision: p.checkedRevision, coverage: p.coverage }));
   const pendingSlides = pages.filter(p => p.stale || p.status !== 'clear');
   const reviewNowSlides = pages.filter(p => p.counts?.overlaps > 0).map(p => p.slide);
   const finalCurrent = sameRevision && record.wholeDeckCheck?.revision === revision && record.wholeDeckCheck?.generation === generation;
@@ -19,7 +19,7 @@ export function auditSummary(record, revision = record?.revision, generation = r
 }
 
 export function compactAudit(audit) {
-  const { pages: workflowPages, ...workflow } = audit.workflow || {};
+  const { pages: workflowPages, pendingSlides: workflowPending, ...workflow } = audit.workflow || {};
   const { allowedOverlapPairs: declared, ...result } = audit;
   return { ...result, workflow, pages: audit.pages.map(({ allowedOverlapPairs, ...page }) => {
     if (!page.issueCount) { delete page.issues; delete page.issuesTruncated; }
@@ -42,15 +42,18 @@ export async function recordAudit(taskDir, session, snapshot, options = {}) {
   const pages = snapshot.slides.map(s => {
     const current = checked.get(s.slide);
     if (current) return { ...current, slideId: s.slideId, pageHash: hashes.get(s.slide), backend,
-      checkedRevision: session.revision, checkedGeneration: session.generation, checkedAt, coverage: audit.coverage, stale: false };
+      checkedRevision: session.revision, checkedGeneration: session.generation, checkedAt, stale: false };
     const old = previous?.pages.find(p => p.slideId === s.slideId);
     if (!old) return { slide: s.slide, slideId: s.slideId, status: 'not_checked', stale: true };
-    return { ...old, slide: s.slide, stale: old.pageHash !== hashes.get(s.slide) || old.checkedGeneration !== session.generation || old.backend !== backend };
+    // File sessions use the same package dependency hashes for both audit sources.
+    // Unchecked pages retain their original coverage; newly checked pages use the current audit.
+    const compatibleBasis = session.mode === 'file' || old.backend === backend;
+    return { ...old, slide: s.slide, stale: old.pageHash !== hashes.get(s.slide) || old.checkedGeneration !== session.generation || !compatibleBasis };
   });
   const basis = { taskId: session.taskId, documentId: session.documentId, revision: session.revision,
     generation: session.generation, checkedAt, basis: 'page-content-and-layout-dependencies' };
   const wholeDeckCheck = options.slides ? previous?.wholeDeckCheck : { revision: session.revision, generation: session.generation, checkedAt };
-  const record = { ...basis, coverage: audit.coverage, wholeDeckCheck, pages };
+  const record = { ...basis, coverage: summarizeLayoutCoverage(pages), wholeDeckCheck, pages };
   await writeJson(destination, record);
   const workflow = auditSummary(record);
   const result = { ...audit, ...basis, worklistPath: destination, pendingSlides: workflow.pendingSlides,

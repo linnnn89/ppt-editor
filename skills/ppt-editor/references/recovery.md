@@ -2,7 +2,8 @@
 
 ## Connection and task lifecycle
 
-Version: `0.4.0-rc.4` (local candidate; configuration and discovery do not prove a completed workflow).
+Use `ppt_diagnose` to compare `version` with `diskVersion` and check
+`restartRequired:false`. Configuration and discovery do not prove a completed workflow.
 Codex discovers this skill through the local `.agents/skills/ppt-editor` link.
 Configure the project MCP server as `ppt_editor` following the [repository README](../../../README.md#installation-and-mcp-setup).
 After changing configuration, refresh the MCP connection and verify the available
@@ -34,6 +35,24 @@ lease; NATIVE_BUSY means preserve both tasks and wait for the owning task to fin
 ## Uncertain results and cleanup
 
 If an operation response is missing, inspect the persisted operation receipt and current document revision before retrying. A retry of the same request uses the same operationId. A failed layout audit does not undo a completed edit. Do not regenerate or repeat the edit with a new ID just to obtain a successful check.
+
+When diagnostics report `queuedRequestCancellation:true`, cancelled MCP requests
+are skipped if their handler has not started. Already executing operations retain
+their normal persistence and recovery behavior. Cancelling the caller's wait does
+not roll back an edit; inspect `ppt_status` with the original `operationId` and
+document revision before deciding whether a retry is needed.
+
+With `progressNotifications:true`, clients can opt in using `_meta.progressToken`.
+Messages report real stages, page/operation counts and elapsed time. The numeric
+progress value is an event sequence, not a percentage; stage changes and final
+updates bypass the 250 ms within-stage throttle. Notifications stop when the
+caller cancels or the request finishes. Confirm actual client UI visibility before
+claiming progress is displayed. A completed request still requires inspection of
+its business result, layout report and acceptance status.
+
+Checkpoint-part reuse verifies existing content before skipping a write. On
+`CHECKPOINT_CORRUPT`, preserve the part and revision manifest for inspection;
+do not delete the corrupt part merely to make the next operation succeed.
 
 On `CLEANUP_UNCONFIRMED`, inspect `ppt_status`, its cleanup report and retained checkpoints. An unknown shutdown is persisted and blocks further close, finish and native startup, including after reconnect. Do not erase the record or blindly retry. Preserve recovery data and report what remains unconfirmed.
 

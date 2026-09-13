@@ -58,8 +58,8 @@ File drafting does not start Office or generate images.
   pages with object identifiers, the measured problem and next action. Use summary
   responses where supported; do not repeatedly load whole-deck snapshots or echo
   duplicate pending-page lists. Keep the underlying evidence, unresolved states
-  and failures intact. Current tools may still return duplicate `pendingSlides`;
-  this guidance does not imply that server response compression is implemented.
+  and failures intact. Summary layout reports keep one pending-page list at
+  `layoutAudit.pendingSlides`; full responses and existing receipts retain their format.
 - For an extra quick check use `ppt_validate(layoutCheck:true, checks:"layout",
   slides:[...], detail:"summary")`. File-mode checks parse selected object trees;
   native mode retains whole-document identity guards. Full validation is the default.
@@ -69,6 +69,10 @@ File drafting does not start Office or generate images.
 - Geometry `clear` only covers the reported checks. Native readback can measure
   ordinary unrotated text bounds; diagram internals, strokes, effects and grouped
   child coordinates remain incompletely covered. Inspect them in the final review.
+  Each page's `coverage.textFitDetails` counts `measured` and `unmeasured` text
+  objects and explains missing measurements in `reasons`. The worklist's aggregate
+  counts only current page evidence; `unknownPageCount` counts stale pages or older
+  records without these counters. Do not infer text-fit coverage from another page.
 
 Once all pages are drafted, review the accumulated worklist and fix issues by page.
 A final whole-deck check is required after edits. Prefer committing and rendering
@@ -78,7 +82,10 @@ requested pages. It also returns `reviewBundlePath` so code can inspect the stor
 full snapshot without returning it all to the LLM. Alternatively run `ppt_validate`
 with `layoutCheck:true` and omit `slides` for a separate whole-deck pass. Avoid
 duplicating those full reads when the same evidence already exists. Unchanged page
-evidence survives unrelated edits; affected dependencies invalidate relevant pages.
+evidence survives unrelated edits, including native review followed by file-mode
+edits. Retained pages keep their original coverage; a new file check does not
+establish native text-fit coverage. Changed dependencies or generation invalidate
+the relevant page evidence.
 Use final page previews/contact sheets and detailed views where needed; do not
 generate a screenshot after every ordinary page-edit operation.
 For an immediate overlap exception in file mode, call `ppt_render` with the current
@@ -102,6 +109,13 @@ contact sheets and readable detailed views as needed; code checks or generated
 image paths alone are not visual approval.
 
 ## Benchmarking
+
+For MCP calls, `_meta.pptEditorTiming` reports queue time, execution time and
+accumulated wall-clock intervals between stage events. These diagnostics belong
+to the current call, including receipt replays; they do not rewrite durable
+receipts or measure model thinking time. Compare complete workflows as well as
+individual phases before claiming a speed improvement. Verified checkpoint-part
+reuse reduces repeated writes, not necessarily the whole workflow by that ratio.
 
 When comparing workflows, freeze the input, target changes and acceptance criteria
 before execution. Record actual request/response ordering and measured time; keep

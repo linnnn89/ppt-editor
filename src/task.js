@@ -14,6 +14,7 @@ import { readBackgroundImage, backgroundPatterns } from './background.js';
 import { composeDeck } from './compose.js';
 import { applyDesignTheme, designThemes, planLayout } from './design.js';
 import { recordAudit, auditSummary, readOptional, summarizeNative, assessReview } from './audit-workflow.js';
+import { reportProgress } from './progress.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -740,6 +741,7 @@ export class TaskHost {
         outcome = result.outcome;
         changes = result.changes;
         stateHash = result.stateHash || '';
+        postSnapshot = result.snapshot;
         if (!valid.dryRun) {
           session.revision = result.revision;
         }
@@ -894,6 +896,7 @@ export class TaskHost {
   }
 
   async recordLayoutAudit(session, snapshot, options) {
+    reportProgress('checking-layout');
     return recordAudit(this.taskDir, session, snapshot, options);
   }
 
@@ -1202,6 +1205,8 @@ export class TaskHost {
         visualLayouts: ['two-column','grid','stack'], designThemes: Object.keys(designThemes),
         pageLayoutAudit: { codeOnly: true, overlapReview: 'immediate-unless-declared-design', finalWholeDeckCheck: true, textFit: false, nativeTextBounds: 'ordinary-unrotated-text' },
         batchPageReports: true, pageDependencyFreshness: true, compactInspection: true,
+        queuedRequestCancellation: true, pageTextMeasurementCoverage: true,
+        checkpointPartReuse: 'sha256-verified', progressNotifications: true, requestStageTimings: true,
         inheritedPlaceholderGeometry: 'complete-transform', renderLayoutReadback: true,
         draftCheckpointPreview: true, cumulativePreviewEvidence: true, explicitAcceptance: true,
         backgroundFills: ['solid', 'gradient', 'image', 'texture', 'pattern', 'inherit'], backgroundPatterns: Object.keys(backgroundPatterns),
