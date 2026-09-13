@@ -1,4 +1,5 @@
 import koffi from 'koffi';
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { check, PptError } from './errors.js';
 
@@ -10,6 +11,9 @@ const bind = (library, signature) => library.func(signature);
 const OpenProcess = bind(kernel, 'void * __stdcall OpenProcess(uint32_t, int, uint32_t)');
 const CloseHandle = bind(kernel, 'int __stdcall CloseHandle(void *)');
 const GetLastError = bind(kernel, 'uint32_t __stdcall GetLastError()');
+const CreateFile = bind(kernel, 'void * __stdcall CreateFileW(str16, uint32_t, uint32_t, void *, uint32_t, uint32_t, void *)');
+const WriteFile = bind(kernel, 'int __stdcall WriteFile(void *, void *, uint32_t, _Out_ uint32_t *, void *)');
+const FlushFile = bind(kernel, 'int __stdcall FlushFileBuffers(void *)');
 const GetProcessTimes = bind(kernel, 'int __stdcall GetProcessTimes(void *, void *, void *, void *, void *)');
 const QueryImage = bind(kernel, 'int __stdcall QueryFullProcessImageNameW(void *, uint32_t, void *, _Inout_ uint32_t *)');
 const Wait = bind(kernel, 'uint32_t __stdcall WaitForSingleObject(void *, uint32_t)');
@@ -42,6 +46,30 @@ const ReleaseMutex = bind(kernel, 'int __stdcall ReleaseMutex(void *)');
 
 function winCheck(result, operation) {
   check(result, 'WINDOWS_API_ERROR', `${operation} failed.`, { win32Error: GetLastError() });
+}
+
+export function createLockFile(file, payload) {
+  // CREATE_NEW + read-only sharing prevents stale cleanup from deleting a live lock.
+  // DELETE_ON_CLOSE binds deletion to this handle, including abrupt process exit.
+  const handle = CreateFile(path.toNamespacedPath(file), 0xc0010000, 1, null, 1, 0x04000080, null);
+  if (!handle || BigInt(handle) === 0xffffffffffffffffn) {
+    const win32Error = GetLastError();
+    const code = [80, 183, 32].includes(win32Error) ? 'EEXIST' : win32Error === 5 ? 'EACCES' : 'WINDOWS_API_ERROR';
+    throw new PptError(code, 'Cannot acquire the lock file.', { win32Error });
+  }
+  try {
+    const bytes = Buffer.from(payload), written = [0];
+    winCheck(WriteFile(handle, bytes, bytes.length, written, null), 'WriteFile lock');
+    check(written[0] === bytes.length, 'LOCK_WRITE_FAILED', 'Lock owner metadata was not fully written.');
+    winCheck(FlushFile(handle), 'FlushFileBuffers lock');
+  } catch (error) {
+    CloseHandle(handle);
+    throw error;
+  }
+  let closed = false;
+  return { close() {
+    if (!closed) { winCheck(CloseHandle(handle), 'CloseHandle lock'); closed = true; }
+  } };
 }
 
 function identityFromHandle(handle, pid) {

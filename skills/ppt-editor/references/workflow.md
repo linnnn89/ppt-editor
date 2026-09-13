@@ -5,6 +5,9 @@ never guess a missing target. Office requires authorization; reuse existing
 authorization rather than asking again. Report unavailable tools or unsupported
 operations without claiming work was performed.
 
+For hosts with JavaScript tool orchestration, use [Code mode](code-mode.md) to
+retain full responses and references in code while showing one compact model view.
+
 Default workflow: **file-mode batch drafting → returned page reports → targeted
 page refinement → final whole-deck check and visual review**. Prefer `mode:"file"`
 for supported edits. Use native-copy when a required capability or effective

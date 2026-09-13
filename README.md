@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 Create and edit PowerPoint presentations through an MCP server or command-line interface. The project supports batch changes to `.pptx` files, checks slide layouts, and uses Microsoft PowerPoint to render the saved result for review. Original files are preserved; edited presentations are saved to a new path.
 
-**Version:** `0.4.0-rc.7` — release candidate.
+**Version:** `0.4.0-rc.8` — release candidate.
 
 **Requires Windows x64 and Node.js 24.x on the computer running the MCP server.** The current package supports `>=24 <25` and does not bundle Node.js. Microsoft PowerPoint is required for native editing and rendering.
 
@@ -144,6 +144,10 @@ For a targeted code check, use `ppt_validate` with `layoutCheck:true`, `checks:"
 
 Detailed rules for overlap declarations, revision handling and final review are in the [Skill](skills/ppt-editor/SKILL.md).
 
+For JavaScript tool orchestration, the [code-mode guide](skills/ppt-editor/references/code-mode.md)
+shows how to keep full responses and object references in code state, expose one
+summary to the model, and reuse the exact request when recovering an uncertain result.
+
 ## Tools and examples
 
 The MCP server exposes 14 tools. The CLI provides the same commands without the `ppt_` prefix.
@@ -223,6 +227,8 @@ Edits use task copies and revision-bound object references. `ppt_commit` require
 |---|---|
 | `REVISION_MISMATCH` or a stale reference | Inspect the current document and rebuild the edit using current references. |
 | Missing or uncertain response | Query `ppt_status` with the operationId. Retry the same request with the same ID only after checking its receipt. |
+| `FILE_STATE_MISMATCH` | Stop edits and publication. Inspect both revisions in status and preserve the checkpoint and original operation receipt. |
+| `OPERATION_RECEIPT_UNCONFIRMED` | The edit may already be saved. Retain the pending receipt and inspect durable state; automatic re-execution is blocked. |
 | `NATIVE_BUSY` | Wait for the task holding the Office lease to finish. Do not close another task's Office session. |
 | `CLEANUP_UNCONFIRMED` | Inspect status and retained checkpoints. Do not delete recovery records or assume cleanup succeeded. |
 | `acceptance:incomplete` | Treat the output as not yet accepted. Resource cleanup and final review are separate results. |
