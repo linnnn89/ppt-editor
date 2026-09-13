@@ -9,6 +9,7 @@ import { check } from './errors.js';
 import { exists } from './storage.js';
 import { validateTaskId, assertTaskDirBoundary } from './task.js';
 import packageInfo from '../package.json' with { type: 'json' };
+import { createRequestProgress } from './progress.js';
 
 /**
  * 创建配置完备的 PowerPoint MCP 服务器实例。
@@ -60,19 +61,32 @@ export function createPptMcpServer({ taskHost, taskId, baseDir = 'work/tasks' } 
         description: descriptions[name] || `Execute ${name} on PowerPoint presentation`,
         inputSchema: contracts[name]
       },
-      async args => {
+      async (args, context) => {
+        const receivedAt = performance.now();
+        let timing;
         try {
           check(!stopping, 'SERVER_STOPPING', 'The MCP connection is closing.');
-          const pending = queue.then(() => handler(args));
+          const pending = queue.then(async () => {
+            check(!context.mcpReq.signal.aborted, 'REQUEST_CANCELLED', 'Request cancelled before execution.');
+            // Once started, let the operation retain its durable result or recovery
+            // state. Cancelling the caller's wait must not interrupt persistence.
+            const progress = createRequestProgress(context.mcpReq, name, receivedAt);
+            let completed = false;
+            try {
+              const result = await progress.run(() => handler(args)); completed = true; return result;
+            } finally { timing = await progress.finish(completed ? 'completed' : 'failed'); }
+          });
           queue = pending.catch(() => {});
           const result = await pending;
           return {
             content: [{ type: 'text', text: JSON.stringify(result) }],
-            structuredContent: result
+            structuredContent: result,
+            _meta: { pptEditorTiming: timing }
           };
         } catch (error) {
           return {
             isError: true,
+            ...(timing ? { _meta: { pptEditorTiming: timing } } : {}),
             content: [{
               type: 'text',
               text: JSON.stringify({

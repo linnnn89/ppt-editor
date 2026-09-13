@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { PptError, check } from './errors.js';
 import { processIdentity, sameProcess, waitForExit, terminateOwnedProcess } from './windows.js';
+import { currentProgress, reportProgress } from './progress.js';
 
 export function assertCleanupConfirmed(report) {
   const known = report?.office === 'not_started' || ['completed', 'application_preserved'].includes(report?.cleanup);
@@ -17,10 +18,16 @@ export class NativeHost {
 
   async start() {
     if (this.worker) { check(!this.broken, 'NATIVE_HOST_UNAVAILABLE', 'Native executor failed; resume from a checkpoint.'); return; }
+    reportProgress('starting-native-worker');
     this.worker = fork(fileURLToPath(new URL('./native-worker.js', import.meta.url)), [], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'], windowsHide: true, execArgv: ['--expose-gc'] });
     this.worker.stderr.on('data', chunk => { this.lastError = ((this.lastError || '') + chunk).slice(-4000); });
     this.worker.on('message', message => {
-      if (message.stage) { this.lastStage = message.stage; if (message.lease) this.lastLease = message.lease; return; }
+      if (message.stage) {
+        this.lastStage = message.stage; if (message.lease) this.lastLease = message.lease;
+        const { stage, completed, total, unit } = message;
+        this.pending.get(message.id)?.progress?.({ stage, completed, total, unit });
+        return;
+      }
       const pending = this.pending.get(message.id); if (!pending) return;
       clearTimeout(pending.timer); this.pending.delete(message.id);
       if (message.error) pending.reject(new PptError(message.error.code, message.error.message, message.error.details));
@@ -54,7 +61,7 @@ export class NativeHost {
         try { terminateOwnedProcess(this.identity); } catch {}
         reject(new PptError('NATIVE_TIMEOUT', 'Native request timed out; outcome may be unknown. Resume from the last durable checkpoint.', { method, worker: this.identity, outcome: 'outcome_unknown' }));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, progress: currentProgress() });
       this.worker.send({ id, method, args, ownerKey: this.ownerKey }, error => { if (error) { clearTimeout(timer); this.pending.delete(id); reject(error); } });
     });
   }
@@ -66,6 +73,7 @@ export class NativeHost {
       try { result = await this.request('shutdown', { interrupted }, 30000); }
       catch (error) { shutdownError = { code: error.code || 'NATIVE_SHUTDOWN_FAILED', message: error.message }; }
     }
+    reportProgress('confirming-native-exit');
     const workerExited = await waitForExit(this.identity, 10000);
     let officeExited = null;
     const observedOffice = [];

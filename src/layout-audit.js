@@ -1,5 +1,23 @@
 import { check } from './errors.js';
 
+const coverageFor = textFitDetails => ({
+  objectBounds: true, objectOverlap: 'possible-overlap-only',
+  textFit: textFitDetails.measured ? 'native-text-bounds-partial' : 'not_checked', textFitDetails,
+  chartAndSmartArtInternals: 'not_checked', groupChildCoordinates: 'unresolved', strokeAndEffects: 'not_checked'
+});
+
+export function summarizeLayoutCoverage(pages) {
+  const details = { measured: 0, unmeasured: 0, reasons: {} };
+  for (const page of pages) {
+    const counts = page.coverage?.textFitDetails;
+    // Stale pages and pre-count worklists cannot establish current measurements.
+    if (page.stale || !counts) { details.unknownPageCount = (details.unknownPageCount || 0) + 1; continue; }
+    details.measured += counts.measured; details.unmeasured += counts.unmeasured;
+    for (const [reason, count] of Object.entries(counts.reasons)) details.reasons[reason] = (details.reasons[reason] || 0) + count;
+  }
+  return coverageFor(details);
+}
+
 // Object-frame checks only. Text layout, strokes, transparency and intentional
 // layering need final review; a rectangle intersection is not proof of occlusion.
 export function auditLayout(snapshot, { slides, tolerancePt = 0.5, allowedOverlapPairs = [] } = {}) {
@@ -21,13 +39,27 @@ export function auditLayout(snapshot, { slides, tolerancePt = 0.5, allowedOverla
     check(available.has(slide), 'SLIDE_NOT_FOUND', 'Layout check slide is out of range.', { slide });
     const objects = snapshot.objects.filter(o => o.slide === slide && !['background', 'notes'].includes(o.kind));
     const boxes = [], issues = [], counts = { outOfBounds: 0, overlaps: 0, unresolved: 0, textOverflow: 0 };
+    const textFitDetails = { measured: 0, unmeasured: 0, reasons: {} };
     let allowedOverlapCount = 0;
     const add = (type, issue) => { counts[type]++; if (issues.length < 100) issues.push(issue); };
     for (const object of objects) {
       const ref = { key: object.key, name: object.name, kind: object.kind };
-      const g = object.geometry;
-      if (object.groupPath?.length || !g || !['left', 'top', 'width', 'height'].every(k => Number.isFinite(g[k])) ||
-          g.width < 0 || g.height < 0 || !Number.isFinite(g.rotation ?? 0)) {
+      const g = object.geometry, t = object.textBounds;
+      const grouped = !!object.groupPath?.length;
+      const geometryResolved = g && ['left', 'top', 'width', 'height'].every(k => Number.isFinite(g[k])) &&
+        g.width >= 0 && g.height >= 0 && Number.isFinite(g.rotation ?? 0);
+      let measuredText = false;
+      if (object.kind === 'text' && (object.text || t)) {
+        const reason = grouped ? 'group_child' : !geometryResolved ? 'geometry_unresolved' :
+          Math.abs(g.rotation || 0) >= 0.01 ? 'rotated_text' :
+          !t ? g.source === 'native-effective' ? 'native_measurement_unavailable' : 'native_readback_not_run' :
+          ![t.left, t.top, t.width, t.height].every(Number.isFinite) || t.width < 0 || t.height < 0 ? 'invalid_text_bounds' : null;
+        if (reason) {
+          textFitDetails.unmeasured++;
+          textFitDetails.reasons[reason] = (textFitDetails.reasons[reason] || 0) + 1;
+        } else { textFitDetails.measured++; measuredText = true; }
+      }
+      if (grouped || !geometryResolved) {
         add('unresolved', { code: 'GEOMETRY_UNRESOLVED', object: ref }); continue;
       }
       const angle = (g.rotation || 0) * Math.PI / 180;
@@ -41,8 +73,7 @@ export function auditLayout(snapshot, { slides, tolerancePt = 0.5, allowedOverla
         code: 'OUT_OF_SLIDE', object: ref, overflowPt: Object.fromEntries(Object.entries(outside).map(([k,v]) => [k,round(v)]))
       });
       boxes.push(box);
-      const t = object.textBounds;
-      if (t && [t.left,t.top,t.width,t.height].every(Number.isFinite) && Math.abs(g.rotation || 0) < 0.01) {
+      if (measuredText) {
         const overflow = { left: Math.max(0,g.left-t.left), top: Math.max(0,g.top-t.top),
           right: Math.max(0,t.left+t.width-g.left-g.width), bottom: Math.max(0,t.top+t.height-g.top-g.height) };
         if (Object.values(overflow).some(v => v > tolerancePt)) add('textOverflow', { code: 'TEXT_OUTSIDE_FRAME', object: ref,
@@ -60,14 +91,12 @@ export function auditLayout(snapshot, { slides, tolerancePt = 0.5, allowedOverla
     const issueCount = Object.values(counts).reduce((a,b) => a+b,0);
     return { slide, status: counts.outOfBounds || counts.overlaps || counts.textOverflow ? 'issues' : counts.unresolved ? 'incomplete' : 'clear',
       objectsChecked: boxes.length, allowedOverlapCount, allowedOverlapPairs: allowedOverlapPairs.filter(pair => objectsByKey.get(pair[0]).slide === slide),
-      counts, issueCount, issuesTruncated: issueCount > issues.length, issues };
+      counts, issueCount, issuesTruncated: issueCount > issues.length, issues, coverage: coverageFor(textFitDetails) };
   });
   return { scope: slides ? 'selected-slides' : 'all-slides', tolerancePt, pages,
     summary: { slidesChecked: pages.length, clearSlides: pages.filter(p => p.status === 'clear').map(p => p.slide),
       attentionSlides: pages.filter(p => p.status !== 'clear').map(p => p.slide), issueCount: pages.reduce((sum,p) => sum+p.issueCount,0) },
-    coverage: { objectBounds: true, objectOverlap: 'possible-overlap-only',
-      textFit: snapshot.objects.some(o => selected.includes(o.slide) && o.textBounds) ? 'native-text-bounds-partial' : 'not_checked',
-      chartAndSmartArtInternals: 'not_checked', groupChildCoordinates: 'unresolved', strokeAndEffects: 'not_checked' },
+    coverage: summarizeLayoutCoverage(pages),
     allowedOverlapPairs,
     nextAction: pages.some(p => p.counts.overlaps) ? 'review_overlap_before_continuing' : 'continue_drafting_then_review_all_slides',
     screenshotRequiredNow: pages.some(p => p.counts.overlaps) };

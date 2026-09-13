@@ -8,13 +8,53 @@ import { FileEngine } from '../src/file-engine.js';
 import JSZip from 'jszip';
 import { NS, parseXml, descendants, child, xml, readPackage, writePackage, writePackageOptimized, zipManifest } from '../src/ooxml.js';
 import { contracts } from '../src/contracts.js';
-import { hash, prepareNewOutput, publishNew } from '../src/storage.js';
+import { hash, stableJson, prepareNewOutput, publishNew } from '../src/storage.js';
 
 const directory = () => path.resolve('work/tests', randomUUID());
 const sampleDeck = { title: 'Regression fixture', slides: [
   { items: [{ type: 'text', text: 'Original 中文 😀 text', left: 50, top: 50, width: 650, height: 80, name: 'Heading' }, { type: 'table', rows: [['Name', 'Value'], ['Alpha', '12']], left: 50, top: 170, width: 400, height: 150, name: 'Data' }], notes: 'Original notes' },
   { items: [{ type: 'text', text: 'Untouched slide', left: 30, top: 40, width: 650, height: 80, name: 'Untouched' }] }
 ] };
+
+test('checkpoint persistence reuses verified parts across ten edits and disk restores', async t => {
+  const folder = directory(), bytes = await buildDeck({ slides: Array.from({ length: 10 }, (_, i) => ({ items: [
+    { type: 'text', name: `Page ${i + 1}`, text: `Page ${i + 1}`, left: 40, top: 40, width: 300, height: 60 }
+  ] })) });
+  let engine = await FileEngine.create(folder, bytes), partWrites = 0;
+  const open = fs.open.bind(fs), partDirectory = path.join(folder, 'parts') + path.sep;
+  t.mock.method(fs, 'open', (file, ...args) => {
+    if (String(file).startsWith(partDirectory) && args[0] === 'wx') partWrites++;
+    return open(file, ...args);
+  });
+  for (let slide = 1; slide <= 10; slide++) {
+    const target = engine.inspect({ slides: [slide] }).objects.find(o => o.kind === 'text');
+    await engine.apply([{ type: 'set_geometry', target, geometry: { top: 70 } }]);
+    engine = await FileEngine.restore(folder);
+  }
+  assert.equal(partWrites, 10, 'Each distinct modified part is written once, including across restored instances');
+  assert.equal(engine.revision, 10);
+  assert(engine.inspect().objects.filter(o => o.kind === 'text').every(o => o.geometry.top === 70));
+  const output = await readPackage(await engine.bytes());
+  for (const [name, data] of engine.parts) assert.deepEqual(output.get(name), data, name);
+  assert.deepEqual(await fs.readFile(path.join(folder, 'source.pptx')), bytes);
+});
+
+test('a corrupt reusable checkpoint part blocks the next revision without overwriting recovery evidence', async () => {
+  const folder = directory(), engine = await FileEngine.create(folder, await buildDeck(sampleDeck));
+  const heading = engine.inspect().objects.find(o => o.name === 'Heading');
+  await engine.apply([{ type: 'set_geometry', target: heading, geometry: { top: 70 } }]);
+  const manifestPath = path.join(folder, 'revision.json'), manifest = await fs.readFile(manifestPath);
+  const entry = JSON.parse(manifest).overlay['ppt/slides/slide1.xml'];
+  const partPath = path.join(folder, 'parts', entry.file), damaged = Buffer.from('damaged checkpoint evidence');
+  await fs.writeFile(partPath, damaged);
+  const target = engine.inspect().objects.find(o => o.name === 'Untouched');
+  await assert.rejects(engine.apply([{ type: 'set_geometry', target, geometry: { top: 90 } }]), { code: 'CHECKPOINT_CORRUPT' });
+  assert.equal(engine.revision, 1);
+  assert.equal(engine.inspect().objects.find(o => o.name === 'Untouched').geometry.top, 40);
+  assert.deepEqual(await fs.readFile(manifestPath), manifest);
+  assert.deepEqual(await fs.readFile(partPath), damaged);
+  await assert.rejects(FileEngine.restore(folder), { code: 'CHECKPOINT_CORRUPT' });
+});
 
 test('file edits preserve source and untouched parts, and recover from disk', async () => {
   // Explicit ZIP directory entries are legal and must not delete their children.
@@ -34,6 +74,32 @@ test('file edits preserve source and untouched parts, and recover from disk', as
   assert.deepEqual([...output.keys()].sort(), [...engine.parts.keys()].sort());
   for (const [name, data] of engine.parts) assert.deepEqual(output.get(name), data, name);
   assert.equal(hash(await fs.readFile(path.join(folder, 'source.pptx'))), sourceHash);
+});
+
+test('scoped preflight supports minimal keys across slides, notes and backgrounds with a complete post-edit snapshot', async () => {
+  const folder=directory(),bytes=await buildDeck({...sampleDeck,slides:[...sampleDeck.slides,
+    {items:[{type:'text',name:'Preserved',text:'Third page',left:30,top:40,width:400,height:60}]}]});
+  const engine=await FileEngine.create(folder,bytes),initial=engine.inspect();
+  const minimal=object=>({key:object.key,fingerprint:object.fingerprint});
+  const target=initial.objects.find(o=>o.name==='Untouched');
+  const notes=initial.objects.find(o=>o.kind==='notes'&&o.slide===1);
+  const background=initial.objects.find(o=>o.kind==='background'&&o.slide===2);
+  const result=await engine.apply([
+    {type:'set_geometry',target:minimal(target),geometry:{left:75}},
+    {type:'replace_text',target:minimal(notes),search:'Original',replacement:'Revised',expectedMatches:1,crossRunPolicy:'reject'},
+    {type:'set_slide_background',target:minimal(background),color:'224466'}
+  ]);
+  assert.equal(result.snapshot.slides.length,3);
+  assert.equal(result.snapshot.objects.find(o=>o.name==='Untouched').geometry.left,75);
+  assert.equal(result.snapshot.objects.find(o=>o.kind==='notes'&&o.slide===1).text,'Revised notes');
+  assert.equal(result.snapshot.objects.find(o=>o.kind==='background'&&o.slide===2).color,'224466');
+  assert.equal(result.snapshot.objects.find(o=>o.name==='Preserved').text,'Third page');
+  const restored=await FileEngine.restore(folder),verified=restored.inspect();
+  assert.deepEqual(result.snapshot,verified);
+  assert.equal(result.stateHash,hash(stableJson(verified.objects.map(o=>[o.key,o.fingerprint]))));
+  assert.deepEqual(restored.parts.get('ppt/slides/slide3.xml'),engine.sourceParts.get('ppt/slides/slide3.xml'));
+  await assert.rejects(engine.apply([{type:'set_geometry',target:minimal(target),geometry:{left:90}}]),{code:'TARGET_CHANGED'});
+  assert.equal(engine.revision,1);
 });
 
 test('inherited placeholder geometry requires a complete explicit transform and preserves other parts', async () => {

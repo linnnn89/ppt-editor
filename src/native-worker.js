@@ -13,6 +13,10 @@ const require = createRequire(import.meta.url);
 let winax, app, appLease, releaseSta, releaseMutex, pump, started = false, stopping = false;
 const documents = new Map();
 let workerOwnerKey;
+let currentRequestId;
+const reportProgress = (stage, details = {}) => {
+  if (process.connected && currentRequestId) process.send({ id: currentRequestId, stage, ...details });
+};
 const normalize = text => String(text || '').replaceAll('\r\n', '\n').replaceAll('\r', '\n').replaceAll('\v', '\n');
 const release = (...refs) => { try { winax?.release(...refs.filter(Boolean)); } catch {} };
 const stateHash = snapshot => hash(stableJson(snapshot.objects.map(o => [o.key, o.fingerprint])));
@@ -60,6 +64,7 @@ async function invoke(callback) {
 
 function ensureApplication() {
   if (app) return;
+  reportProgress('starting-office');
   releaseMutex = acquireNativeMutex();
   const before = new Set(listProcesses('POWERPNT.EXE').map(p => p.pid));
   try {
@@ -86,7 +91,7 @@ function ensureApplication() {
       identity = candidate; identityMethod = 'exclusive-hidden-activation';
     }
     appLease = { identity, identityMethod, observedNewProcesses, authority: identity ? 'identified-application' : 'document-only', createdByTask: Boolean(identity && !before.has(identity.pid)), preexistingDocumentCount, protectedViewCount, version: String(app.Version), build: String(app.Build), quitRequested: false };
-    process.send({ stage: 'application-ready', lease: appLease });
+    reportProgress('application-ready', { lease: appLease });
   } catch (error) { release(app); app = null; releaseMutex?.(); releaseMutex = null; throw error; }
 }
 
@@ -126,7 +131,9 @@ function inspectDocument(doc) {
   const size = doc.pres.PageSetup;
   const width = Number(size.SlideWidth), height = Number(size.SlideHeight); release(size);
   const slideCollection = doc.pres.Slides;
-  for (let slideIndex = 1; slideIndex <= Number(slideCollection.Count); slideIndex++) {
+  const slideCount = Number(slideCollection.Count);
+  reportProgress('reading-native-object-snapshot', { completed: 0, total: slideCount, unit: 'slides' });
+  for (let slideIndex = 1; slideIndex <= slideCount; slideIndex++) {
     const slide = slideCollection.Item(slideIndex), slideId = Number(slide.SlideID);
     const page = { slide: slideIndex, slideId, objectCount: 0 }; slides.push(page);
     // 索引幻灯片背景对象，读取有效背景颜色
@@ -215,6 +222,7 @@ function inspectDocument(doc) {
     }
     const shapes = slide.Shapes; visit(shapes); release(shapes);
     const notesPage = slide.NotesPage, noteShapes = notesPage.Shapes; visit(noteShapes, [], true); release(noteShapes, notesPage, slide);
+    reportProgress('reading-native-object-snapshot', { completed: slideIndex, total: slideCount, unit: 'slides' });
   }
   release(slideCollection);
   return { width, height, slides, objects };
@@ -230,6 +238,7 @@ function guard(doc) {
 }
 
 async function checkpoint(doc, destination) {
+  reportProgress('saving-checkpoint');
   if (path.resolve(destination).toLowerCase() !== path.resolve(String(doc.pres.FullName)).toLowerCase()) {
     await prepareNewOutput(destination);
     await invoke(() => doc.pres.SaveCopyAs(destination, 24));
@@ -418,16 +427,19 @@ async function closeDocument(doc, { interrupted = false } = {}) {
   await readPackage(bytes);
   // This is exclusively a task copy whose content is in the verified checkpoint.
   // Saved=true is used only to discard that duplicate in-memory state on close.
+  reportProgress('closing-document');
   if (!doc.readOnly) doc.pres.Saved = -1;
   doc.pres.Close(); release(doc.pres); doc.pres = null; documents.delete(doc.id);
 }
 
 async function validateFile(args) {
+  reportProgress('checking-package');
   const bytes = await fs.readFile(args.path), sha256 = hash(bytes);
   check(sha256 === args.sha256, 'CHECKPOINT_CORRUPT', 'Readback candidate bytes mismatch.');
   const parts = await readPackage(bytes); await checkNativeSafe(parts);
   const structural = validatePackage(parts);
   ensureApplication();
+  reportProgress('opening-readback');
   const { pres } = await invoke(() => ({ pres: app.Presentations.Open(args.path, -1, 0, 0) }));
   const doc = { id: randomUUID(), pres, readOnly: true, checkpoint: { path: args.path, sha256 } };
   documents.set(doc.id, doc);
@@ -440,13 +452,16 @@ async function validateFile(args) {
     if (args.render) {
       await fs.mkdir(args.render.directory, { recursive: true });
       const slides = pres.Slides;
+      const selected = [...new Set(args.render.slides)];
+      reportProgress('rendering-slides', { completed: 0, total: selected.length, unit: 'slides' });
       try {
-        for (const number of [...new Set(args.render.slides)]) {
+        for (const number of selected) {
           check(number <= snapshot.slides.length, 'SLIDE_NOT_FOUND', 'Render slide is out of range.');
           const destination = path.join(args.render.directory, `slide-${number}.png`), slide = slides.Item(number);
           try { await invoke(() => slide.Export(destination, 'PNG', args.render.width, Math.round(args.render.width * snapshot.height / snapshot.width))); }
           finally { release(slide); }
           images.push({ slide: number, path: destination, sha256: hash(await fs.readFile(destination)) });
+          reportProgress('rendering-slides', { completed: images.length, total: selected.length, unit: 'slides' });
         }
       } finally { release(slides); }
     }
@@ -455,18 +470,17 @@ async function validateFile(args) {
 }
 
 async function openDocument(args) {
+  reportProgress('checking-package');
   check(!documents.has(args.documentId), 'DOCUMENT_ALREADY_OPEN', 'Document ID is already bound in this worker.');
   const bytes = await fs.readFile(args.path); await checkNativeSafe(await readPackage(bytes));
   ensureApplication();
-  process.send({ stage: 'opening-task-copy' });
+  reportProgress('opening-task-copy');
   const { pres } = await invoke(() => ({ pres: app.Presentations.Open(args.path, 0, 0, args.visible ? -1 : 0) }));
   check(path.resolve(String(pres.FullName)).toLowerCase() === path.resolve(args.path).toLowerCase(), 'DOCUMENT_IDENTITY_MISMATCH', 'PowerPoint opened a different path.');
   const doc = { id: args.documentId, pres, openedPath: path.resolve(args.path), directory: args.directory, revision: args.revision || 0, generation: args.generation || 1, visible: args.visible, unusable: false };
   documents.set(doc.id, doc);
   try {
-    process.send({ stage: 'saving-initial-checkpoint' });
     doc.checkpoint = await checkpoint(doc, path.join(doc.directory, `native-${doc.generation}-${doc.revision}.pptx`));
-    process.send({ stage: 'reading-native-object-snapshot' });
     const snapshot = inspectDocument(doc); doc.stateHash = stateHash(snapshot);
     return { snapshot, checkpoint: doc.checkpoint, revision: doc.revision, generation: doc.generation, lease: appLease,
       binding: { documentId: doc.id, openedPath: doc.openedPath, worker: processIdentity(process.pid), office: appLease.identity, officeIdentityMethod: appLease.identityMethod, boundAt: new Date().toISOString() } };
@@ -486,8 +500,10 @@ async function apply(args) {
   await prepareNewOutput(nextCheckpointPath);
   const completed = [];
   try {
+    reportProgress('applying-operations', { completed: 0, total: args.operations.length, unit: 'operations' });
     for (const [index, op] of args.operations.entries()) {
       await applyOperation(doc, op); completed.push({ index, type: op.type, key: op.target.key });
+      reportProgress('applying-operations', { completed: completed.length, total: args.operations.length, unit: 'operations' });
       pumpMessages(); await delay(0);
     }
     const nextSnapshot = inspectDocument(doc);
@@ -496,6 +512,7 @@ async function apply(args) {
     return { outcome: 'completed', durable: true, revision: doc.revision, generation: doc.generation, snapshot: nextSnapshot, checkpoint: doc.checkpoint, changes: completed };
   } catch (error) {
     try {
+      reportProgress('restoring-checkpoint');
       const saved = await fs.readFile(doc.checkpoint.path);
       check(hash(saved) === doc.checkpoint.sha256, 'CHECKPOINT_CORRUPT', 'Recovery checkpoint hash changed.'); await readPackage(saved);
       doc.pres.Saved = -1; doc.pres.Close(); release(doc.pres);
@@ -540,6 +557,7 @@ async function commitDocument(doc, args) {
   await prepareNewOutput(targetPath);
   const candidate = path.join(doc.directory, `commit-${randomUUID()}.pptx`);
   try {
+    reportProgress('saving-output');
     await prepareNewOutput(candidate);
     await invoke(() => doc.pres.SaveCopyAs(candidate, 24));
     const bytes = await fs.readFile(candidate);
@@ -553,6 +571,7 @@ async function commitDocument(doc, args) {
 }
 
 async function shutdown(interrupted = false) {
+  reportProgress('closing-native-resources');
   const closed = [], errors = [];
   for (const doc of Array.from(documents.values())) {
     try { await closeDocument(doc, { interrupted }); closed.push(doc.id); }
@@ -563,7 +582,7 @@ async function shutdown(interrupted = false) {
     let remaining;
     try { remaining = Number(presentations.Count) + Number(protectedViews.Count); }
     finally { release(protectedViews, presentations); }
-    if (remaining === 0 && Number(app.Visible) === 0 && sameProcess(appLease.identity)) { await invoke(() => app.Quit()); appLease.quitRequested = true; }
+    if (remaining === 0 && Number(app.Visible) === 0 && sameProcess(appLease.identity)) { reportProgress('closing-office'); await invoke(() => app.Quit()); appLease.quitRequested = true; }
     else appLease.quitSkipped = 'Application contains external presentations, is visible, or its process identity changed.';
   }
   // winax temporary property/method wrappers retain COM references. Collect
@@ -580,6 +599,7 @@ let queue = Promise.resolve();
 process.on('message', message => {
   queue = queue.then(async () => {
     const { id, method, args = {}, ownerKey } = message;
+    currentRequestId = id;
     try {
       if (method === 'initialize') {
         check(!started, 'ALREADY_STARTED', 'Worker already initialized.');
@@ -601,11 +621,13 @@ process.on('message', message => {
       else if (method === 'render') {
         const doc = getDocument(args.documentId), snapshot = guard(doc), images = [];
         await fs.mkdir(args.directory, { recursive: true });
+        reportProgress('rendering-slides', { completed: 0, total: args.slides.length, unit: 'slides' });
         for (const number of args.slides) {
           check(number <= snapshot.slides.length, 'SLIDE_NOT_FOUND', 'Render slide is out of range.');
           const destination = path.join(args.directory, `slide-${number}.png`), slide = doc.pres.Slides.Item(number);
           await invoke(() => slide.Export(destination, 'PNG', args.width, Math.round(args.width * snapshot.height / snapshot.width))); release(slide);
           images.push({ slide: number, path: destination, sha256: hash(await fs.readFile(destination)) });
+          reportProgress('rendering-slides', { completed: images.length, total: args.slides.length, unit: 'slides' });
         }
         result = { images, revision: doc.revision, generation: doc.generation, visualReview: 'not_run' };
       } else if (method === 'close') { const doc = getDocument(args.documentId); await closeDocument(doc, { interrupted: args.interrupted }); result = { closed: true }; }
@@ -616,6 +638,7 @@ process.on('message', message => {
       } else throw new PptError('UNKNOWN_NATIVE_METHOD', 'Unknown native method.');
       process.send({ id, result });
     } catch (error) { process.send?.({ id, error: errorResult(error) }); }
+    finally { currentRequestId = undefined; }
   }).catch(error => { process.stderr.write(JSON.stringify(errorResult(error)) + '\n'); process.exit(1); });
 });
 process.once('disconnect', () => { if (!stopping) queue.then(() => shutdown(true)).finally(() => process.exit(0)); });

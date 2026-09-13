@@ -12,6 +12,30 @@ import { buildDeck } from '../src/build.js';
 import { listProcesses } from '../src/windows.js';
 
 const object = (key,left,top,width,height,extra={}) => ({ key,name:key,kind:'text',slide:1,groupPath:[],geometry:{left,top,width,height,rotation:0},...extra });
+
+test('text-fit coverage counts actual measurements per page and explains unsupported text', () => {
+  const native = { left: 40, top: 40, width: 200, height: 60, rotation: 0, source: 'native-effective' };
+  const objects = [
+    { textBounds: { left: 45, top: 45, width: 160, height: 25 } },
+    { geometry: { ...native, rotation: 20 } },
+    { groupPath: [9] },
+    {},
+    { geometry: { ...native, source: 'slide-explicit' } },
+    { textBounds: { left: 45, top: 45, width: -1, height: 25 } }
+  ].map((extra, i) => object(`text-${i + 1}`, 40, 40, 200, 60, { slide: i + 1, text: 'Visible text', geometry: native, ...extra }));
+  const snapshot = { width: 640, height: 360, slides: objects.map(o => ({ slide: o.slide })), objects };
+  const result = auditLayout(snapshot);
+  assert.equal(result.pages[0].coverage.textFit, 'native-text-bounds-partial');
+  assert.deepEqual(result.pages[0].coverage.textFitDetails, { measured: 1, unmeasured: 0, reasons: {} });
+  const reasons = ['rotated_text', 'group_child', 'native_measurement_unavailable', 'native_readback_not_run', 'invalid_text_bounds'];
+  for (let i = 1; i < result.pages.length; i++) {
+    assert.equal(result.pages[i].coverage.textFit, 'not_checked');
+    assert.deepEqual(result.pages[i].coverage.textFitDetails, { measured: 0, unmeasured: 1, reasons: { [reasons[i - 1]]: 1 } });
+  }
+  assert.deepEqual(result.coverage.textFitDetails, { measured: 1, unmeasured: 5, reasons: Object.fromEntries(reasons.map(r => [r, 1])) });
+  assert.equal(auditLayout(snapshot, { slides: [2] }).coverage.textFit, 'not_checked');
+  assert.equal(result.pages[1].status, 'clear', 'Unmeasured text does not change the established geometry acceptance rule');
+});
 test('layout audit distinguishes declared design overlaps, suspicious overlaps, page bounds and unknown geometry', () => {
   const snapshot={width:100,height:100,slides:[{slide:1}],objects:[object('a',10,10,30,20),object('b',30,15,30,20),object('edge',90,90,10,10),object('bg',0,0,100,100,{kind:'background'})]};
   const result=auditLayout(snapshot);
