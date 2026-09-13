@@ -65,7 +65,9 @@ npm ci
 
 ### 连接 Codex
 
-将以下配置加入项目的 `.codex/config.toml`，并替换为本机的 Node 可执行文件和仓库路径。`command` 必须指向 **Node.js 24.x 的可执行文件**；终端中的 Node 版本正确，并不代表此处配置的可执行文件也是同一版本。
+仅在某个项目中使用时，将以下配置加入该项目的 `.codex/config.toml`；Codex 只加载受信任项目的配置。需要跨项目使用时，写入用户级 `~/.codex/config.toml`。目录或文件不存在时创建；已有 `ppt_editor` 时更新同名配置表并保留其他设置。配置作用域见 [Codex MCP 官方指南](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
+
+将 Node 可执行文件和仓库路径替换为本机路径。`command` 必须指向 **Node.js 24.x 的可执行文件**；终端中的 Node 版本正确，并不代表此处配置的可执行文件也是同一版本。
 
 ```toml
 [mcp_servers.ppt_editor]
@@ -79,18 +81,48 @@ enabled = true
 
 直接用 Node 启动服务，避免包管理器的输出干扰 STDIO 通信。启动 MCP 服务本身不会启动 PowerPoint。
 
-项目配置仅在该项目中生效。如果希望其他项目也能使用此服务，可将同样的配置条目放入用户级 `~/.codex/config.toml`。仅安装 Skill 不会注册 MCP 服务。
-
 ### 添加 Agent Skill
 
-[项目 Skill](skills/ppt-editor/SKILL.md) 为 Agent 提供编辑操作指南，不负责安装或配置 MCP 服务。在仓库根目录执行以下命令，可让 Agent 在本项目中发现该技能。如果目标路径已存在，请先检查其内容。
+[Skill](skills/ppt-editor/SKILL.md) 提供操作入口和三份专项手册。安装 Skill 不会安装项目依赖或注册 MCP 服务。用户和本地 AI Agent 均可按照以下命令操作。
+
+按 [Codex Skill 官方指南](https://learn.chatgpt.com/docs/build-skills)选择一种发现范围：
+
+| 范围 | Skill 位置 | 生效范围 |
+|---|---|---|
+| `project` | `<项目>/.agents/skills/ppt-editor` | 当前项目及其子目录；下方示例使用本仓库 |
+| `user` | `~/.agents/skills/ppt-editor` | 该用户的各个项目 |
+
+在仓库根目录运行下面的命令，将 `$skillScope` 设为 `project` 或 `user`。命令将 Skill 子目录作为 Windows 目录联接，指向仓库中维护的版本；已有目标会保留并显示出来，供检查后决定如何更新。
 
 ```powershell
-New-Item -ItemType Directory -Path .agents/skills -Force | Out-Null
-New-Item -ItemType Junction -Path .agents/skills/ppt-editor -Target (Resolve-Path skills/ppt-editor).Path
+$skillSource = (Resolve-Path -LiteralPath 'skills/ppt-editor' -ErrorAction Stop).Path
+$skillScope = 'project'
+$skillParent = switch ($skillScope) {
+    'project' { Join-Path (Get-Location).Path '.agents/skills' }
+    'user' { Join-Path $HOME '.agents/skills' }
+    default { throw 'Choose project or user for skillScope.' }
+}
+$skillDestination = Join-Path $skillParent 'ppt-editor'
+$existingSkill = Get-Item -LiteralPath $skillDestination -Force -ErrorAction SilentlyContinue
+if ($existingSkill) {
+    $existingSkill | Format-List FullName, LinkType, Target
+    throw 'Destination already exists. Inspect it before updating.'
+}
+New-Item -ItemType Directory -Path $skillParent -Force -ErrorAction Stop | Out-Null
+New-Item -ItemType Junction -Path $skillDestination -Target $skillSource -ErrorAction Stop | Out-Null
+Get-Item -LiteralPath $skillDestination | Format-List FullName, LinkType, Target
+Get-Content -LiteralPath (Join-Path $skillDestination 'SKILL.md')
 ```
 
-刷新 MCP 连接后，调用 `ppt_diagnose` 核对实际运行的版本和功能。更新磁盘文件不会自动重载已启动的服务进程。本地 MCP 配置、Skill 链接和任务数据均已排除在 Git 提交范围之外。
+目录联接会跟随仓库更新，已有正确联接无须再复制一份。请保留仓库的配置路径。如果已有目标是独立副本，先备份到 Skill 发现目录之外，再比较并更新完整的 `skills/ppt-editor` 文件夹，包括 `references/`。只复制 `SKILL.md` 会缺少操作手册。
+
+### 验证安装
+
+1. 核对命令显示的安装目录和联接目标。安装目录应包含 `SKILL.md` 及 `references/workflow.md`、`references/tools.md`、`references/recovery.md`。
+2. 确认 Codex 的可用技能中出现 `ppt-editor`。文件变化被检测后仍未出现时，重启 Codex；用户级安装还应在另一个项目中核对。
+3. 刷新 MCP 连接并调用 `ppt_diagnose`，确认 `version` 与 `diskVersion` 一致、`restartRequired:false`，并且当前 14 个工具可用。用户级 Skill 要跨项目调用这些工具，还需要用户级 MCP 配置。
+
+Skill 被发现、MCP 连接成功、实际文稿编辑成功是不同的检查。更新磁盘文件不会自动重载已启动的 MCP 进程。本地项目 MCP 配置、Skill 联接和任务数据均已排除在 Git 提交范围之外。
 
 ## 推荐工作流
 
@@ -102,17 +134,9 @@ New-Item -ItemType Junction -Path .agents/skills/ppt-editor -Target (Resolve-Pat
 4. **集中修复相关页面。** 重新查询有问题的页面，取得最新引用。多个已明确、互不依赖的修复可以合并到同一批次。复用仍然有效的检查结果，避免重复验证或重新加载全文稿。未解决的问题和过期结果应继续保留在待办记录中。
 5. **审查最终文件。** 提交到新路径后，使用返回的 `reviewId` 调用 `ppt_render`，设置 `layoutCheck:true` 和 `detail:"summary"`。这会在渲染所需的回读过程中完成最终全稿布局检查。查看每一页最终结果，按需使用缩略图总览和局部放大。继续修改后，应重新提交并审查新文件。只有代码检查和视觉审查均完成，才能以 `requireAccepted:true` 结束任务。
 
-布局摘要只在 `layoutAudit.pendingSlides` 返回一份待处理页清单；完整响应和已保存的操作回执保留原有格式。原生审查后继续使用文件模式编辑时，未变化页保留原检查证据及其覆盖范围。页面依赖或 generation 变化会使相关证据失效；文件检查不能证明已完成原生文字边界检查。
+逐页报告会保留当前有效证据，并标明尚未完整检查的内容；几何结果为 `clear` 不代表文字边界已经完整测量。覆盖范围、证据有效性及最终验收规则见[工作流手册](skills/ppt-editor/references/workflow.md)。
 
-每页通过 `coverage.textFitDetails` 报告已测量和未测量的文字对象数（`measured`、`unmeasured`），并列出旋转文字、组内对象、缺少原生回读等原因。累计覆盖统计只计入当前有效的页面证据；`unknownPageCount` 表示证据过期或旧记录缺少计数的页数。几何结果为 `clear` 不代表每个文字对象都已测量。
-
-MCP 请求在排队期间被取消，会在执行前跳过。操作开始执行后，取消调用方的等待不会中断持久化，也不会撤销修改。重试前先用原 `operationId` 查询 `ppt_status`；重试同一请求时复用原 ID。
-
-客户端传入 `_meta.progressToken` 后，可收到绑定当前请求的阶段、页面或操作计数及耗时。同一阶段的连续更新最多每 250 ms 一次，阶段切换和完成时立即报告。协议中的 progress 是递增的事件序号，不是完成百分比。取消或结束后停止通知；收到通知不代表客户端界面已经展示。
-
-MCP 响应的 `_meta.pptEditorTiming` 提供排队时间 `queueMs`、执行时间 `elapsedMs` 和累计阶段时间 `stages[].elapsedMs`。它们按阶段事件之间的实际经过时间计量，不是 CPU 耗时；回放回执时记录的是本次回放耗时。计时元数据不会修改业务结果或已保存的操作回执，CLI 的 JSON 输出保持原格式。
-
-文件检查点会验证内容哈希，再复用已经落盘的部件。已有部件损坏时返回 `CHECKPOINT_CORRUPT`，保留损坏内容供检查，并阻止新修订提交；缺少的部件仍采用原子写入，最后再保存修订清单。
+MCP 支持取消处理、可选进度通知和阶段计时；文件检查点会复用已验证的落盘部件。取消、进度和检查点故障的细则见[连接与恢复手册](skills/ppt-editor/references/recovery.md#uncertain-results-and-cleanup)，计时字段和解释见[性能比较](skills/ppt-editor/references/workflow.md#benchmarking)。
 
 `screenshotRequiredNow` 当前用于标记重叠报告；值为 false 并不表示没有其他视觉问题。代码检查无法判断设计意图，也无法完整评估可读性。生成了图片不等于已经查看过图片。
 

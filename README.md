@@ -65,7 +65,9 @@ The install script builds `winax` and runs a native-module smoke test. It uses N
 
 ### Connect Codex
 
-Add the following to the project's `.codex/config.toml`. Replace the Node executable and repository paths with the paths on your machine. The `command` must point to a **Node.js 24.x executable**; a compatible Node in your terminal does not guarantee that this configured executable uses the same version.
+For project-only access, add the following to that project's `.codex/config.toml`; Codex loads project configuration only for trusted projects. For access across projects, use your user `~/.codex/config.toml`. Create the directory/file if needed; if `ppt_editor` already exists, update its table and preserve unrelated settings. See the [Codex MCP configuration guide](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+Replace the Node executable and repository paths with the paths on your machine. The `command` must point to a **Node.js 24.x executable**; a compatible Node in your terminal does not guarantee that this configured executable uses the same version.
 
 ```toml
 [mcp_servers.ppt_editor]
@@ -79,18 +81,48 @@ enabled = true
 
 Run the server directly with Node so package-manager output does not interfere with STDIO. Starting the server does not start PowerPoint.
 
-The project configuration applies within that project. To make the server available across projects, use the same entry in your user `~/.codex/config.toml`. Installing the Skill alone does not register the server.
-
 ### Add the agent Skill
 
-The [project Skill](skills/ppt-editor/SKILL.md) provides editing instructions for the agent; it does not install or configure the MCP server. To make it discoverable in this project, run the following from the repository root. If the destination already exists, inspect it before making changes.
+The [Skill](skills/ppt-editor/SKILL.md) supplies instructions and three task-specific manuals. Installing it does not install dependencies or register the MCP server. Users and local agents can follow the same commands below.
+
+Choose one discovery scope, as described in the [Codex Skill guide](https://learn.chatgpt.com/docs/build-skills):
+
+| Scope | Skill location | Availability |
+|---|---|---|
+| `project` | `<project>/.agents/skills/ppt-editor` | This project and its subdirectories; the example uses this repository |
+| `user` | `~/.agents/skills/ppt-editor` | The user's projects |
+
+Run this in the repository root. Set `$skillScope` to `project` or `user`. The Skill subfolder is a Windows directory junction to the repository's maintained copy; an existing destination is left intact for inspection.
 
 ```powershell
-New-Item -ItemType Directory -Path .agents/skills -Force | Out-Null
-New-Item -ItemType Junction -Path .agents/skills/ppt-editor -Target (Resolve-Path skills/ppt-editor).Path
+$skillSource = (Resolve-Path -LiteralPath 'skills/ppt-editor' -ErrorAction Stop).Path
+$skillScope = 'project'
+$skillParent = switch ($skillScope) {
+    'project' { Join-Path (Get-Location).Path '.agents/skills' }
+    'user' { Join-Path $HOME '.agents/skills' }
+    default { throw 'Choose project or user for skillScope.' }
+}
+$skillDestination = Join-Path $skillParent 'ppt-editor'
+$existingSkill = Get-Item -LiteralPath $skillDestination -Force -ErrorAction SilentlyContinue
+if ($existingSkill) {
+    $existingSkill | Format-List FullName, LinkType, Target
+    throw 'Destination already exists. Inspect it before updating.'
+}
+New-Item -ItemType Directory -Path $skillParent -Force -ErrorAction Stop | Out-Null
+New-Item -ItemType Junction -Path $skillDestination -Target $skillSource -ErrorAction Stop | Out-Null
+Get-Item -LiteralPath $skillDestination | Format-List FullName, LinkType, Target
+Get-Content -LiteralPath (Join-Path $skillDestination 'SKILL.md')
 ```
 
-Refresh the MCP connection, then call `ppt_diagnose` to check the running version and capabilities. Updating files on disk does not reload an existing server process. Local MCP configuration, the Skill link and task data are excluded from Git.
+A junction follows updates to the repository, so a correctly linked installation needs no second copy. Keep the repository at the configured path. If an existing destination is an independent copy, back it up outside the Skill discovery directories and compare it before updating the complete `skills/ppt-editor` folder, including `references/`. Copying only `SKILL.md` omits the operating manuals.
+
+### Verify installation
+
+1. Check the displayed destination and junction target. The installed folder must contain `SKILL.md` and `references/workflow.md`, `references/tools.md`, `references/recovery.md`.
+2. Confirm that `ppt-editor` appears in Codex's available skills. If it does not appear after the file change is detected, restart Codex. For a user installation, also check from another project.
+3. Refresh the MCP connection and call `ppt_diagnose`. Confirm `version` matches `diskVersion`, `restartRequired:false`, and the current 14-tool list is available. A user-level Skill needs a user-level MCP entry to use these tools across projects.
+
+Skill discovery, MCP connection, and successful presentation editing are separate checks. Updating files on disk does not reload an existing MCP process. Local project MCP configuration, the Skill link and task data are excluded from Git.
 
 ## Recommended workflow
 
@@ -102,17 +134,9 @@ Refresh the MCP connection, then call `ppt_diagnose` to check the running versio
 4. **Keep repairs focused.** Query the affected slide with fresh references. Several known, independent fixes may share a batch. Reuse current check results instead of repeating the same validation or loading the entire deck again. Keep unresolved and stale results visible in the worklist.
 5. **Review the final output.** Commit to a new path, then call `ppt_render` with the returned `reviewId`, `layoutCheck:true` and `detail:"summary"`. This combines the final whole-deck layout check with the readback used for rendering. Inspect every final page, using contact sheets and detailed views as needed. After further edits, commit again and review the new output. Finish with `requireAccepted:true` only when the checks and visual review are complete.
 
-Summary layout reports return the pending-page list once, in `layoutAudit.pendingSlides`; full responses and saved operation receipts retain their existing format. When native review is followed by file-mode edits, unchanged pages keep their original evidence and coverage. Changes to page dependencies or generation invalidate that evidence; file checks do not establish native text-fit coverage.
+Page reports retain current evidence and identify incomplete checks; geometry `clear` does not establish complete text-fit coverage. See the [workflow manual](skills/ppt-editor/references/workflow.md) for coverage, freshness and final acceptance rules.
 
-Each page reports `coverage.textFitDetails`: `measured` and `unmeasured` text-object counts, with reasons such as rotated text, group children or missing native readback. Accumulated coverage counts current page evidence only; `unknownPageCount` identifies stale pages or older records without these counters. A geometry result of `clear` does not mean every text object was measured.
-
-MCP requests cancelled while still queued are skipped before execution. Once an operation has started, cancelling the caller's wait does not interrupt persistence or roll back the edit. Check `ppt_status` with its `operationId` before retrying, and reuse the same ID for the same request.
-
-Clients that send `_meta.progressToken` receive request-bound stages, slide/operation counts and elapsed time. Repeated updates within a stage are limited to one per 250 ms, with stage changes and completion reported immediately. The protocol progress value is an increasing event number, not a completion percentage. Notifications stop after cancellation or completion; receiving them does not prove the client UI displays them.
-
-MCP response `_meta.pptEditorTiming` contains `queueMs`, execution `elapsedMs` and accumulated `stages[].elapsedMs`. These are wall-clock intervals between observed stages, not CPU profiles; receipt replay measures the replay request. Timing metadata does not alter business results or durable receipts. CLI JSON output remains unchanged.
-
-File checkpoints reuse already stored parts only after verifying their content hash. A corrupt existing part fails with `CHECKPOINT_CORRUPT` and is preserved for inspection; the next revision is not committed. Missing parts are written atomically, followed by the revision manifest.
+MCP supports cancellation handling, optional progress notifications and stage timings; file checkpoints reuse verified stored parts. See [connection and recovery](skills/ppt-editor/references/recovery.md#uncertain-results-and-cleanup) for cancellation, progress and checkpoint failures, and [benchmarking](skills/ppt-editor/references/workflow.md#benchmarking) for timing fields and interpretation.
 
 `screenshotRequiredNow` currently identifies overlap reports; a false value does not rule out other visual problems. Code checks cannot determine design intent or fully assess readability. A generated image is not evidence that someone has inspected it.
 

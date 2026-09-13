@@ -31,9 +31,19 @@ Read the section for the operation you need. The [editing workflow](workflow.md)
   - `set_style`: Set `fontSize`, `fontFace` (Latin and CJK), `color` (6-char hex like `"17365D"`), `bold`, `italic`, `underline`; booleans support true and false.
   - `set_geometry`: Set `left`, `top`, `width`, `height`, `rotation` in points (pt).
   - `set_table_cell`: Update text in a specific table cell (`row`, `column`, 1-indexed).
-  - `set_slide_background`: Use legacy `color` OR `fill` (never both): solid, two-color linear gradient, image, texture, pattern, inherit. See the editing reference in the [README](../../../README.md#editing-reference) for fields and limits.
+  - `set_slide_background`: Use legacy `color` OR `fill` (never both). See [Background fills](#background-fills) for fields and limits.
   - `convert_to_smartart` (native-copy): Convert an inspected top-level text box with `layout: process | cycle | hierarchy`. The layout must exist in Office or an explicitly opened same-task template. Never substitute another layout after SMARTART_LAYOUT_UNAVAILABLE. The regression fixture verifies hierarchy only.
   - `set_smartart_text` (native-copy): Set a 1-based `nodeIndex` from the fresh SmartArt snapshot. Long text may overflow; no automatic font shrinking is promised.
+
+### Background fills
+
+`fill.type` selects the required fields: `solid` uses `color`; `gradient` uses
+`startColor`, `endColor` and optional `angle` (0–360 degrees, default 0);
+`pattern` uses `pattern`, `foreground`, `background`; `image` and `texture` use
+`path`; `inherit` has no other fields. Colors are six-digit hex. All types except
+`inherit` accept `transparency` from 0 to 100 (default 0).
+Images and textures require a local PNG/JPEG file of at most 20 MiB. Use pattern
+names from `ppt_diagnose.capabilities.backgroundPatterns`; do not invent names.
 
 ## Commit and Finish (`ppt_commit` & `ppt_finish`)
 

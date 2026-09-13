@@ -4,8 +4,14 @@
 
 Use `ppt_diagnose` to compare `version` with `diskVersion` and check
 `restartRequired:false`. Configuration and discovery do not prove a completed workflow.
-Codex discovers this skill through the local `.agents/skills/ppt-editor` link.
-Configure the project MCP server as `ppt_editor` following the [repository README](../../../README.md#installation-and-mcp-setup).
+Codex discovers this Skill in a project's `.agents/skills/ppt-editor` or the user's
+`~/.agents/skills/ppt-editor`. The Skill supplies instructions; MCP is configured
+separately as `ppt_editor`. For setup, read `README.md` in the local runtime
+checkout; the [repository installation guide](https://github.com/linnnn89/ppt-editor/blob/main/README.md#installation-and-mcp-setup) is the online copy.
+Locate the checkout from the server configuration's `cwd` or absolute `src/mcp.js`
+argument, not by walking up from the installed Skill directory. If MCP is absent,
+use the CLI from a known runtime checkout with absolute input/output paths, or
+report the missing connection. Identify CLI execution as such.
 After changing configuration, refresh the MCP connection and verify the available
 tools. If the tools are absent, report that limitation instead of claiming direct
 MCP execution. Starting the server or listing tools does not start PowerPoint.
@@ -52,7 +58,9 @@ its business result, layout report and acceptance status.
 
 Checkpoint-part reuse verifies existing content before skipping a write. On
 `CHECKPOINT_CORRUPT`, preserve the part and revision manifest for inspection;
-do not delete the corrupt part merely to make the next operation succeed.
+do not delete the corrupt part merely to make the next operation succeed. A hash
+mismatch blocks the next revision. Missing parts are written atomically, followed
+by the revision manifest.
 
 On `CLEANUP_UNCONFIRMED`, inspect `ppt_status`, its cleanup report and retained checkpoints. An unknown shutdown is persisted and blocks further close, finish and native startup, including after reconnect. Do not erase the record or blindly retry. Preserve recovery data and report what remains unconfirmed.
 
