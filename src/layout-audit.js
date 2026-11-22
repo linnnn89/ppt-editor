@@ -20,7 +20,8 @@ export function summarizeLayoutCoverage(pages) {
 
 // Object-frame checks only. Text layout, strokes, transparency and intentional
 // layering need final review; a rectangle intersection is not proof of occlusion.
-export function auditLayout(snapshot, { slides, tolerancePt = 0.5, allowedOverlapPairs = [] } = {}) {
+export function auditLayout(snapshot, { slides, tolerancePt = 0.5, allowedOverlapPairs = [] } = {},
+  { previousTextPages, fileCheck, overflowBySlide } = {}) {
   check(Number.isFinite(snapshot.width) && snapshot.width > 0 && Number.isFinite(snapshot.height) && snapshot.height > 0,
     'LAYOUT_SIZE_UNAVAILABLE', 'Page dimensions are unavailable.');
   const selected = slides || snapshot.slides.map(s => s.slide);
@@ -39,7 +40,11 @@ export function auditLayout(snapshot, { slides, tolerancePt = 0.5, allowedOverla
     check(available.has(slide), 'SLIDE_NOT_FOUND', 'Layout check slide is out of range.', { slide });
     const objects = snapshot.objects.filter(o => o.slide === slide && !['background', 'notes'].includes(o.kind));
     const boxes = [], issues = [], counts = { outOfBounds: 0, overlaps: 0, unresolved: 0, textOverflow: 0 };
-    const textFitDetails = { measured: 0, unmeasured: 0, reasons: {} };
+    let textFitDetails = { measured: 0, unmeasured: 0, reasons: {} };
+    const previous = previousTextPages?.get(slide);
+    const priorIssues = previous?.textOverflowIssues ?? previous?.issues?.filter(i => i.code === 'TEXT_OUTSIDE_FRAME') ?? [];
+    const overflows = new Map(priorIssues.map(issue => [issue.object.key, issue]));
+    const unsampled = (previous?.counts?.textOverflow || 0) - overflows.size;
     let allowedOverlapCount = 0;
     const add = (type, issue) => { counts[type]++; if (issues.length < 100) issues.push(issue); };
     for (const object of objects) {
@@ -76,9 +81,19 @@ export function auditLayout(snapshot, { slides, tolerancePt = 0.5, allowedOverla
       if (measuredText) {
         const overflow = { left: Math.max(0,g.left-t.left), top: Math.max(0,g.top-t.top),
           right: Math.max(0,t.left+t.width-g.left-g.width), bottom: Math.max(0,t.top+t.height-g.top-g.height) };
-        if (Object.values(overflow).some(v => v > tolerancePt)) add('textOverflow', { code: 'TEXT_OUTSIDE_FRAME', object: ref,
+        if (Object.values(overflow).some(v => v > tolerancePt)) overflows.set(object.key, { code: 'TEXT_OUTSIDE_FRAME', object: ref,
           overflowPt: Object.fromEntries(Object.entries(overflow).map(([k,v]) => [k,round(v)])), basis: 'native-text-bounds' });
+        else overflows.delete(object.key);
       }
+    }
+    // File geometry cannot supersede measured text on an unchanged page. A new
+    // native read clears only objects it actually measured.
+    if (fileCheck && previous?.coverage?.textFitDetails) textFitDetails = previous.coverage.textFitDetails;
+    for (const issue of overflows.values()) add('textOverflow', issue);
+    // Older worklists retained at most 100 issue samples across all categories.
+    if (unsampled > 0 && (fileCheck || textFitDetails.unmeasured > 0 || !textFitDetails.measured)) counts.textOverflow += unsampled;
+    if (overflowBySlide && overflows.size > issues.filter(i => i.code === 'TEXT_OUTSIDE_FRAME').length) {
+      overflowBySlide.set(slide, [...overflows.values()]);
     }
     for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
       const a = boxes[i], b = boxes[j];

@@ -234,20 +234,32 @@ export class FileEngine {
     const meta = await readJson(path.join(directory, 'revision.json'));
     check(hash(bytes) === meta.sourceHash, 'CHECKPOINT_CORRUPT', 'Source snapshot hash mismatch.');
     const engine = new FileEngine(directory, bytes, await readPackage(bytes), meta.revision);
-    for (const [name, entry] of Object.entries(meta.overlay)) {
+    const overlay = Object.entries(meta.overlay), removedParts = meta.removedParts ?? [];
+    check(Array.isArray(removedParts), 'CHECKPOINT_CORRUPT', 'Invalid checkpoint deletion list.');
+    for (const name of removedParts) {
+      check(!Object.hasOwn(meta.overlay, name) && isGeneratedBackgroundImage(name, engine.parts.get(name)),
+        'CHECKPOINT_CORRUPT', 'Invalid removed background image.', { part: name });
+      engine.parts.delete(name);
+    }
+    for (const [name, entry] of overlay) {
       check(/^[a-f0-9]{64}\.part$/.test(entry.file), 'CHECKPOINT_CORRUPT', 'Invalid checkpoint part name.');
       const data = await fs.readFile(path.join(directory, 'parts', entry.file));
       check(hash(data) === entry.sha256, 'CHECKPOINT_CORRUPT', 'Checkpoint part hash mismatch.'); engine.parts.set(name, data);
     }
-    validatePackage(engine.parts); return engine;
+    if (overlay.length || removedParts.length) validatePackage(engine.parts);
+    return engine;
   }
 
   inspect(options) { return indexPackage(this.parts, options); }
   validate() {
-    const structural = validatePackage(this.parts);
+    return this.validationReport(validatePackage(this.parts));
+  }
+  validationReport(structural) {
     const changedParts = [], preservedParts = [];
     for (const [name, bytes] of this.parts) (this.sourceParts.has(name) && bytes.equals(this.sourceParts.get(name)) ? preservedParts : changedParts).push(name);
-    return { structural, preservation: { basis: 'uncompressed part bytes', changedParts, unchangedPartCount: preservedParts.length, unknownPartsRetained: true }, nativeReadback: 'not_run', visualReview: 'not_run' };
+    const removedParts = [...this.sourceParts.keys()].filter(name => !this.parts.has(name));
+    return { structural, preservation: { basis: 'uncompressed part bytes', changedParts, ...(removedParts.length ? { removedParts } : {}),
+      unchangedPartCount: preservedParts.length, unknownPartsRetained: true }, nativeReadback: 'not_run', visualReview: 'not_run' };
   }
 
   prepare(operations) {
@@ -257,6 +269,7 @@ export class FileEngine {
     const slideIds = new Set(operations.map(op => Number(op.target.key.split(':')[1])));
     const slides = this.inspect({ slides: [] }).slides.filter(s => slideIds.has(s.slideId)).map(s => s.slide);
     const baseline = new Map(this.inspect({ slides }).objects.map(o => [o.key, o])), candidate = new Map(this.parts), documents = new Map(), changes = [];
+    const backgroundSlides = new Map();
     for (const op of operations) {
       const item = baseline.get(op.target.key);
       check(item && item.fingerprint === op.target.fingerprint, 'TARGET_CHANGED', 'Target changed since inspection.');
@@ -270,6 +283,7 @@ export class FileEngine {
       if (op.type === 'set_slide_background') {
         const fill = op.fill || { type: 'solid', color: op.color };
         setBackgroundXml(candidate, item.part, fill, op.imageData, doc);
+        backgroundSlides.set(item.part, doc);
         changes.push({ type: op.type, key: item.key, fillType: fill.type, ...(fill.type === 'solid' ? { color: fill.color.toUpperCase() } : {}) });
         continue;
       }
@@ -299,6 +313,7 @@ export class FileEngine {
     }
     reportProgress('preparing-edits', { completed: operations.length, total: operations.length, unit: 'operations' });
     for (const [name, doc] of documents) candidate.set(name, Buffer.from(xml(doc)));
+    if (backgroundSlides.size) pruneBackgroundImages(candidate, backgroundSlides);
     reportProgress('checking-package');
     validatePackage(candidate);
     return { candidate, changes };
@@ -337,7 +352,9 @@ export class FileEngine {
       overlay[name] = { file, sha256 };
       reportProgress('saving-checkpoint', { completed: ++completed, total: changed.length, unit: 'parts' });
     }
-    await writeJson(path.join(this.directory, 'revision.json'), { revision: this.revision, sourceHash: hash(this.sourceBytes), overlay });
+    const removedParts = [...this.sourceParts.keys()].filter(name => !this.parts.has(name));
+    await writeJson(path.join(this.directory, 'revision.json'), { revision: this.revision, sourceHash: hash(this.sourceBytes), overlay,
+      ...(removedParts.length ? { removedParts } : {}) });
   }
 
   async bytes() {
@@ -348,4 +365,4 @@ export class FileEngine {
     return writePackage(this.parts);
   }
 }
-import { setBackgroundXml, describeBackground, readBackgroundImage } from './background.js';
+import { setBackgroundXml, pruneBackgroundImages, isGeneratedBackgroundImage, describeBackground, readBackgroundImage } from './background.js';

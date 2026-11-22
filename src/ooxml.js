@@ -80,6 +80,10 @@ export function zipManifest(bytes) {
 }
 
 export async function readPackage(bytes) {
+  return (await readValidatedPackage(bytes)).parts;
+}
+
+export async function readValidatedPackage(bytes) {
   const entries = zipManifest(bytes);
   const zip = await JSZip.loadAsync(bytes, { checkCRC32: true, createFolders: false });
   const parts = new Map();
@@ -90,8 +94,7 @@ export async function readPackage(bytes) {
     check(data.length === entry.uncompressed, 'INVALID_PACKAGE', 'Expanded ZIP size mismatch.');
     parts.set(entry.name, data);
   }
-  validatePackage(parts);
-  return parts;
+  return { parts, structural: validatePackage(parts) };
 }
 
 export function rels(parts, source) {

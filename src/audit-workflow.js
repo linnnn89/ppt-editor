@@ -37,16 +37,24 @@ export async function recordAudit(taskDir, session, snapshot, options = {}) {
   const selected = options.slides || snapshot.slides.map(s => s.slide);
   const reusable = (previous?.pages || []).filter(p => selected.includes(p.slide) && p.pageHash === hashes.get(p.slide) &&
     p.checkedGeneration === session.generation && p.backend === backend).flatMap(p => p.allowedOverlapPairs || []);
-  const audit = auditLayout(snapshot, { ...options, allowedOverlapPairs: options.allowedOverlapPairs ?? reusable });
+  const previousById = new Map((previous?.pages || []).map(page => [page.slideId, page]));
+  const previousTextPages = new Map(), overflowBySlide = new Map();
+  for (const slide of snapshot.slides) {
+    const page = previousById.get(slide.slideId);
+    if (page && page.checkedGeneration === session.generation && page.pageHash === hashes.get(slide.slide) &&
+        (page.coverage?.textFitDetails?.measured || page.counts?.textOverflow)) previousTextPages.set(slide.slide, page);
+  }
+  const audit = auditLayout(snapshot, { ...options, allowedOverlapPairs: options.allowedOverlapPairs ?? reusable },
+    { previousTextPages, fileCheck: backend === 'file', overflowBySlide });
   const checkedAt = new Date().toISOString(), checked = new Map(audit.pages.map(p => [p.slide, p]));
   const pages = snapshot.slides.map(s => {
     const current = checked.get(s.slide);
     if (current) return { ...current, slideId: s.slideId, pageHash: hashes.get(s.slide), backend,
-      checkedRevision: session.revision, checkedGeneration: session.generation, checkedAt, stale: false };
-    const old = previous?.pages.find(p => p.slideId === s.slideId);
+      checkedRevision: session.revision, checkedGeneration: session.generation, checkedAt, stale: false,
+      ...(overflowBySlide.has(s.slide) ? { textOverflowIssues: overflowBySlide.get(s.slide) } : {}) };
+    const old = previousById.get(s.slideId);
     if (!old) return { slide: s.slide, slideId: s.slideId, status: 'not_checked', stale: true };
     // File sessions use the same package dependency hashes for both audit sources.
-    // Unchecked pages retain their original coverage; newly checked pages use the current audit.
     const compatibleBasis = session.mode === 'file' || old.backend === backend;
     return { ...old, slide: s.slide, stale: old.pageHash !== hashes.get(s.slide) || old.checkedGeneration !== session.generation || !compatibleBasis };
   });
@@ -67,7 +75,20 @@ export function summarizeNative(native) {
 }
 
 export async function assessReview(taskDir, review) {
-  const record = await readOptional(path.join(taskDir, 'layout-audits', `${review.documentId}.json`));
+  let record = await readOptional(path.join(taskDir, 'layout-audits', `${review.documentId}.json`));
+  // An older server could already have erased measured overflow from the
+  // worklist. The committed preview still records it for these exact bytes.
+  const saved = review.preview?.layoutAudit;
+  if (record && saved && review.preview.outputHash === review.outputHash &&
+      saved.revision === record.revision && saved.generation === record.generation) {
+    const overflows = new Map(saved.pages.filter(p => p.counts.textOverflow).map(p => [p.slide, p]));
+    const pages = record.pages.map(page => {
+      const measured = overflows.get(page.slide);
+      if (!measured || page.backend !== 'file' || page.coverage?.textFitDetails?.measured || page.counts?.textOverflow) return page;
+      return { ...page, status: 'issues', counts: { ...page.counts, textOverflow: measured.counts.textOverflow }, coverage: measured.coverage };
+    });
+    record = { ...record, pages, coverage: summarizeLayoutCoverage(pages) };
+  }
   const layout = auditSummary(record, review.revision, review.generation);
   const slideCount = review.preview?.nativeValidation?.slidesCount;
   const previewed = new Set((review.preview?.images || []).map(i => i.slide));

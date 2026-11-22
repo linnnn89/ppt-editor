@@ -220,7 +220,7 @@ node src/cli.js finish --task $task.taskId --reviews '[]'
 
 ## 文件保护与恢复
 
-编辑使用任务副本，对象引用绑定到文稿版本。`ppt_commit` 要求使用新输出路径，拒绝覆盖源文件或已有文件。原生任务只关闭自己持有的文档，并保留此前已经打开的 PowerPoint 会话。
+编辑使用任务副本，对象引用绑定到文稿版本。`ppt_commit` 要求使用新输出路径，拒绝覆盖源文件或已有文件。交付文件应保存在任务的 `documents` 检查点目录之外。旧任务若已将交付文件保存在该目录内，收尾会保留该目录，并返回 `checkpointCleanupSkipped: "published_output"`。原生任务只关闭自己持有的文档，并保留此前已经打开的 PowerPoint 会话。
 
 | 返回结果 | 处理方式 |
 |---|---|

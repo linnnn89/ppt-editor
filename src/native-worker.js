@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { check, PptError, errorResult } from './errors.js';
 import { hash, stableJson, publishNew, prepareNewOutput } from './storage.js';
-import { readPackage, checkNativeSafe, validatePackage } from './ooxml.js';
+import { readPackage, readValidatedPackage, checkNativeSafe, validatePackage } from './ooxml.js';
 import { initializeSta, acquireNativeMutex, listProcesses, processIdentity, sameProcess, windowProcessId, pumpMessages } from './windows.js';
 import { backgroundPatterns, readBackgroundImage } from './background.js';
 
@@ -561,9 +561,9 @@ async function commitDocument(doc, args) {
     await prepareNewOutput(candidate);
     await invoke(() => doc.pres.SaveCopyAs(candidate, 24));
     const bytes = await fs.readFile(candidate);
-    const parts = await readPackage(bytes);
+    const { parts, structural } = await readValidatedPackage(bytes);
     await checkNativeSafe(parts);
-    const validation = { ...validatePackage(parts), basis: 'generated-output-bytes' };
+    const validation = { ...structural, basis: 'generated-output-bytes' };
     const published = await publishNew(targetPath, bytes);
     return { outputPath: published.path, sha256: published.sha256, bytes: published.bytes,
       revision: doc.revision, generation: doc.generation, validation };

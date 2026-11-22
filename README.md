@@ -221,7 +221,7 @@ All template slides are retained and source slides are appended. `templateSlide`
 
 ## File safety and recovery
 
-Edits use task copies and revision-bound object references. `ppt_commit` requires a new output path and refuses to overwrite the source or an existing file. Native tasks only close documents they own and preserve pre-existing PowerPoint sessions.
+Edits use task copies and revision-bound object references. `ppt_commit` requires a new output path and refuses to overwrite the source or an existing file. Save deliverables outside task `documents` checkpoint directories. If an older task published there, finishing retains its checkpoint directory and reports `checkpointCleanupSkipped: "published_output"`. Native tasks only close documents they own and preserve pre-existing PowerPoint sessions.
 
 | Result | Action |
 |---|---|

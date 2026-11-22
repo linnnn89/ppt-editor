@@ -86,9 +86,10 @@ full snapshot without returning it all to the LLM. Alternatively run `ppt_valida
 with `layoutCheck:true` and omit `slides` for a separate whole-deck pass. Avoid
 duplicating those full reads when the same evidence already exists. Unchanged page
 evidence survives unrelated edits, including native review followed by file-mode
-edits. Retained pages keep their original coverage; a new file check does not
-establish native text-fit coverage. Changed dependencies or generation invalidate
-the relevant page evidence.
+edits. A file check on the same page content and dependencies retains existing
+native text measurements. An outstanding overflow is cleared when PowerPoint
+measures that text frame again and it fits. Changed page content, dependencies
+or generation invalidate the corresponding measurements.
 Use final page previews/contact sheets and detailed views where needed; do not
 generate a screenshot after every ordinary page-edit operation.
 For an immediate overlap exception in file mode, call `ppt_render` with the current

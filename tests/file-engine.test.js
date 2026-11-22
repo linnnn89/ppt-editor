@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { buildDeck } from '../src/build.js';
 import { FileEngine } from '../src/file-engine.js';
 import JSZip from 'jszip';
-import { NS, parseXml, descendants, child, xml, readPackage, writePackage, writePackageOptimized, zipManifest } from '../src/ooxml.js';
+import { NS, parseXml, descendants, child, xml, readPackage, rels, writePackage, writePackageOptimized, zipManifest } from '../src/ooxml.js';
 import { contracts } from '../src/contracts.js';
 import { hash, stableJson, prepareNewOutput, publishNew } from '../src/storage.js';
 
@@ -200,6 +200,33 @@ test('slide background can be inspected, modified, persisted and recovered', asy
 
   // 验证只有 slide1 被修改，slide2 保持未变
   assert.deepEqual(engine.validate().preservation.changedParts, ['ppt/slides/slide1.xml']);
+});
+
+test('replacing a background removes its unused image relationship and preserves shared media until the last use', async () => {
+  const folder = directory(), imagePath = path.join(folder, 'sample.png');
+  await fs.mkdir(folder, { recursive: true });
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jWZkAAAAASUVORK5CYII=', 'base64');
+  await fs.writeFile(imagePath, png);
+  const image = { type: 'image', path: imagePath };
+  const bytes = await buildDeck({ slides: [sampleDeck.slides[0], { ...sampleDeck.slides[1], background: image }] });
+  const engineDir = path.join(folder, 'engine');
+  let engine = await FileEngine.create(engineDir, bytes);
+  const background = slide => engine.inspect({ slides: [slide] }).objects.find(o => o.kind === 'background');
+  const change = (slide, fill) => engine.apply([{ type: 'set_slide_background', target: background(slide), fill }]);
+  const media = background(2).fill.imagePart;
+  await change(1, image);
+  await change(1, { type: 'solid', color: 'FFFF00' });
+  engine = await FileEngine.restore(engineDir);
+  const shared = await readPackage(await engine.bytes());
+  assert.deepEqual(shared.get(media), png);
+  assert(!rels(shared, background(1).part).some(r => r.type.endsWith('/image')));
+  assert.equal(background(2).fill.imagePart, media);
+  await change(2, { type: 'inherit' });
+  engine = await FileEngine.restore(engineDir);
+  const output = await readPackage(await engine.bytes());
+  assert(!output.has(media));
+  assert(!rels(output, background(2).part).some(r => r.type.endsWith('/image')));
+  assert.deepEqual((await readPackage(bytes)).get(media), png);
 });
 
 test('writePackageOptimized reuses streams, uses STORE for media, handles deletions and falls back gracefully', async () => {

@@ -64,3 +64,14 @@ export function inside(root, candidate) {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
 }
+
+// Resolve existing junctions even when the destination or its parent is new.
+export async function realPathForOutput(file) {
+  const absolute = path.resolve(file);
+  try { return await fs.realpath(absolute); }
+  catch (error) {
+    const parent = path.dirname(absolute);
+    if (error.code !== 'ENOENT' || parent === absolute) throw error;
+    return path.join(await realPathForOutput(parent), path.basename(absolute));
+  }
+}

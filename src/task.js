@@ -5,10 +5,10 @@ import { contracts } from './contracts.js';
 import { PptError, check } from './errors.js';
 import { FileEngine } from './file-engine.js';
 import { NativeHost, assertCleanupConfirmed } from './native-host.js';
-import { hash, stableJson, writeJson, readJson, atomicWrite, publishNew, exists } from './storage.js';
+import { hash, stableJson, writeJson, readJson, publishNew, exists, inside, realPathForOutput } from './storage.js';
 import { createOwnedJob, createLockFile, restrictAccess, processIdentity } from './windows.js';
 import { buildDeck } from './build.js';
-import { readPackage, validatePackage } from './ooxml.js';
+import { readPackage, readValidatedPackage, validatePackage } from './ooxml.js';
 import packageInfo from '../package.json' with { type: 'json' };
 import { readBackgroundImage, backgroundPatterns } from './background.js';
 import { composeDeck } from './compose.js';
@@ -17,6 +17,11 @@ import { recordAudit, auditSummary, readOptional, summarizeNative, assessReview 
 import { reportProgress } from './progress.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isCheckpointOutput(baseDir, outputPath) {
+  const [taskId, directory] = path.relative(baseDir, outputPath).split(path.sep);
+  return UUID_REGEX.test(taskId) && directory?.toLowerCase() === 'documents';
+}
 
 function fileStateMismatch(meta, checkpointRevision) {
   if (meta.revision === checkpointRevision) return undefined;
@@ -215,25 +220,22 @@ export class TaskHost {
     await assertTaskDirBoundary(this.baseDir, this.taskDir, this.taskId);
     await fs.mkdir(this.taskDir, { recursive: true });
     restrictAccess(this.taskDir, { directory: true });
-    await fs.mkdir(path.join(this.taskDir, 'receipts'), { recursive: true });
-    await fs.mkdir(path.join(this.taskDir, 'reviews'), { recursive: true });
-    await fs.mkdir(path.join(this.taskDir, 'documents'), { recursive: true });
-    await fs.mkdir(path.join(this.taskDir, 'locks'), { recursive: true });
-    await fs.mkdir(path.join(this.taskDir, 'bindings'), { recursive: true });
-
     const taskJsonPath = path.join(this.taskDir, 'task.json');
-    if (!(await exists(taskJsonPath))) {
-      await writeJson(taskJsonPath, {
-        taskId: this.taskId,
-        status: 'active',
-        createdAt: new Date().toISOString()
-      });
-    } else {
-      const info = await readJson(taskJsonPath);
-      if (info.status === 'finished') {
-        this.closed = true;
-      }
+    let info = await readOptional(taskJsonPath);
+    if (!info) {
+      const lock = await FileLock.acquire(path.join(this.taskDir, 'locks', 'task.lock'), { context: 'init' });
+      try {
+        info = await readOptional(taskJsonPath);
+        if (!info) {
+          for (const name of ['receipts', 'reviews', 'documents', 'bindings']) {
+            await fs.mkdir(path.join(this.taskDir, name), { recursive: true });
+          }
+          info = { taskId: this.taskId, status: 'active', createdAt: new Date().toISOString() };
+          await writeJson(taskJsonPath, info);
+        }
+      } finally { await FileLock.release(lock); }
     }
+    this.closed = info.status === 'finished';
     this.initialized = true;
   }
 
@@ -242,13 +244,10 @@ export class TaskHost {
    */
   async assertTaskActive() {
     await this.init();
-    const taskJsonPath = path.join(this.taskDir, 'task.json');
-    if (await exists(taskJsonPath)) {
-      const info = await readJson(taskJsonPath);
-      if (info.status === 'finished') {
-        this.closed = true;
-        throw new PptError('TASK_ALREADY_FINISHED', 'Task is already finished and cannot accept modifications.');
-      }
+    const info = await readJson(path.join(this.taskDir, 'task.json'));
+    if (info.status === 'finished') {
+      this.closed = true;
+      throw new PptError('TASK_ALREADY_FINISHED', 'Task is already finished and cannot accept modifications.');
     }
     check(!this.closed, 'TASK_CLOSED', 'Task is already closed.');
   }
@@ -273,18 +272,30 @@ export class TaskHost {
    */
   async loadReviews() {
     const reviewsDir = path.join(this.taskDir, 'reviews');
-    if (!(await exists(reviewsDir))) return;
-    try {
-      const files = await fs.readdir(reviewsDir);
-      for (const file of files) {
-        if (file.endsWith('.json')) {
-          const review = await readJson(path.join(reviewsDir, file)).catch(() => null);
-          if (review && review.reviewId) {
-            this.reviews.set(review.reviewId, review);
-          }
-        }
-      }
-    } catch {}
+    const loaded = new Map();
+    for (const file of await fs.readdir(reviewsDir)) {
+      if (!file.endsWith('.json')) continue;
+      const review = await readJson(path.join(reviewsDir, file)).catch(error => {
+        if (error instanceof SyntaxError) throw new PptError('INVALID_REVIEW_RECORD', 'Cannot parse stored review record.', { file });
+        throw error;
+      });
+      check(review && UUID_REGEX.test(review.reviewId) && file === review.reviewId + '.json' &&
+        UUID_REGEX.test(review.documentId) && typeof review.outputPath === 'string' && path.isAbsolute(review.outputPath),
+        'INVALID_REVIEW_RECORD', 'Review record is invalid. Preserve the task and restore the record before retrying.', { file });
+      loaded.set(review.reviewId, review);
+    }
+    for (const reviewId of this.reviews.keys()) check(loaded.has(reviewId), 'REVIEW_RECORD_MISSING',
+      'A previously registered review is missing. Preserve the task before retrying.', { reviewId });
+    this.reviews = loaded;
+  }
+
+  async containsPublishedOutput(directory) {
+    if (!this.reviews.size) return false;
+    const resolved = await realPathForOutput(directory);
+    for (const { outputPath } of this.reviews.values()) {
+      if (inside(directory, outputPath) || inside(resolved, await realPathForOutput(outputPath))) return true;
+    }
+    return false;
   }
 
   /**
@@ -479,87 +490,95 @@ export class TaskHost {
       const originalPath = path.resolve(valid.path);
       check(await exists(originalPath), 'SOURCE_NOT_FOUND', 'Source presentation file does not exist.', { path: originalPath });
       const bytes = await fs.readFile(originalPath);
-      const sourceHash = hash(bytes);
-
-      if (valid.mode === 'native-copy') {
-        check(valid.allowOffice, 'OFFICE_NOT_ALLOWED', 'Native mode requires explicit allowOffice permission.');
-      }
-
-      const documentId = randomUUID();
-      const docDir = path.join(this.taskDir, 'documents', documentId);
-      await fs.mkdir(docDir, { recursive: true });
-      restrictAccess(docDir, { directory: true });
-
-      let engine = null;
-      let stateHash = '';
-      let revision = 0;
-      let generation = 0;
-      let checkpointPath = null;
-      let nativeBinding = null;
-
-      if (valid.mode === 'file') {
-        engine = await FileEngine.create(path.join(docDir, 'engine'), bytes);
-        stateHash = hash(stableJson(engine.inspect().objects.map(o => [o.key, o.fingerprint])));
-      } else {
-        const nativeHost = await this.ensureNativeHost();
-        const workingPath = path.join(docDir, 'working.pptx');
-        await fs.writeFile(workingPath, bytes);
-        const opened = await nativeHost.request('open', {
-          documentId,
-          path: workingPath,
-          directory: docDir,
-          visible: valid.visible
-        });
-        stateHash = opened.snapshot?.stateHash || '';
-        // 严格同步工作进程真实返回的 generation 与 revision
-        generation = opened.generation;
-        revision = opened.revision;
-        checkpointPath = opened.checkpoint?.path || workingPath;
-        nativeBinding = opened.binding;
-      }
-
-      const session = new DocumentSession({
-        documentId,
-        taskId: this.taskId,
-        originalPath,
-        mode: valid.mode,
-        allowOffice: valid.allowOffice,
-        visible: valid.visible,
-        directory: docDir,
-        engine,
-        revision,
-        generation,
-        checkpointPath,
-        closed: false
-      });
-
-      this.sessions.set(documentId, session);
-      await this.recordBinding(documentId, { originalPath, sourceHash, mode: valid.mode, native: nativeBinding });
-
-      await writeJson(path.join(docDir, 'meta.json'), {
-        documentId,
-        taskId: this.taskId,
-        originalPath,
-        sourceHash,
-        mode: valid.mode,
-        allowOffice: valid.allowOffice,
-        visible: valid.visible,
-        revision,
-        generation,
-        checkpointPath,
-        closed: false,
-        createdAt: new Date().toISOString()
-      });
-
-      return {
-        documentId,
-        mode: valid.mode,
-        revision,
-        generation,
-        sourceHash,
-        stateHash
-      };
+      const registration = await FileLock.acquire(path.join(this.taskDir, 'locks', 'task.lock'), { context: 'open' });
+      try {
+        await this.assertTaskActive();
+        return await this.#registerDocument(valid, originalPath, bytes);
+      } finally { await FileLock.release(registration); }
     });
+  }
+
+  async #registerDocument(valid, originalPath, bytes) {
+    const sourceHash = hash(bytes);
+
+    if (valid.mode === 'native-copy') {
+      check(valid.allowOffice, 'OFFICE_NOT_ALLOWED', 'Native mode requires explicit allowOffice permission.');
+    }
+
+    const documentId = randomUUID();
+    const docDir = path.join(this.taskDir, 'documents', documentId);
+    await fs.mkdir(docDir, { recursive: true });
+    restrictAccess(docDir, { directory: true });
+
+    let engine = null;
+    let stateHash = '';
+    let revision = 0;
+    let generation = 0;
+    let checkpointPath = null;
+    let nativeBinding = null;
+
+    if (valid.mode === 'file') {
+      engine = await FileEngine.create(path.join(docDir, 'engine'), bytes);
+      stateHash = hash(stableJson(engine.inspect().objects.map(o => [o.key, o.fingerprint])));
+    } else {
+      const nativeHost = await this.ensureNativeHost();
+      const workingPath = path.join(docDir, 'working.pptx');
+      await fs.writeFile(workingPath, bytes);
+      const opened = await nativeHost.request('open', {
+        documentId,
+        path: workingPath,
+        directory: docDir,
+        visible: valid.visible
+      });
+      stateHash = opened.snapshot?.stateHash || '';
+      // 严格同步工作进程真实返回的 generation 与 revision
+      generation = opened.generation;
+      revision = opened.revision;
+      checkpointPath = opened.checkpoint?.path || workingPath;
+      nativeBinding = opened.binding;
+    }
+
+    const session = new DocumentSession({
+      documentId,
+      taskId: this.taskId,
+      originalPath,
+      mode: valid.mode,
+      allowOffice: valid.allowOffice,
+      visible: valid.visible,
+      directory: docDir,
+      engine,
+      revision,
+      generation,
+      checkpointPath,
+      closed: false
+    });
+
+    this.sessions.set(documentId, session);
+    await this.recordBinding(documentId, { originalPath, sourceHash, mode: valid.mode, native: nativeBinding });
+
+    await writeJson(path.join(docDir, 'meta.json'), {
+      documentId,
+      taskId: this.taskId,
+      originalPath,
+      sourceHash,
+      mode: valid.mode,
+      allowOffice: valid.allowOffice,
+      visible: valid.visible,
+      revision,
+      generation,
+      checkpointPath,
+      closed: false,
+      createdAt: new Date().toISOString()
+    });
+
+    return {
+      documentId,
+      mode: valid.mode,
+      revision,
+      generation,
+      sourceHash,
+      stateHash
+    };
   }
 
   /**
@@ -741,6 +760,7 @@ export class TaskHost {
         };
       });
 
+      if (!valid.dryRun) await this.loadReviews();
       let outcome = '';
       if (session.mode === 'native-copy') for (const op of normalizedOperations) {
         if (op.type !== 'set_slide_background' || !['image', 'texture'].includes(op.fill?.type)) continue;
@@ -821,7 +841,6 @@ export class TaskHost {
       }
 
       if (!valid.dryRun) {
-        await this.loadReviews();
         for (const review of this.reviews.values()) {
           if (review.documentId === session.documentId) {
             review.stale = true;
@@ -932,6 +951,10 @@ export class TaskHost {
     const valid = contracts.ppt_commit.parse(params);
     return this.executeIdempotent(valid.operationId, valid, async () => {
       await this.assertTaskActive();
+      const targetPath = path.resolve(valid.outputPath);
+      check(!isCheckpointOutput(this.baseDir, targetPath) &&
+        !isCheckpointOutput(await fs.realpath(this.baseDir), await realPathForOutput(targetPath)),
+        'OUTPUT_IN_CHECKPOINT_DIRECTORY', 'Choose an output path outside task document checkpoint directories.');
       if (this.sessions.get(valid.documentId)?.mode === 'file') this.sessions.delete(valid.documentId);
       const session = await this.getSession(valid.documentId);
       check(session && !session.closed, 'SESSION_NOT_FOUND', 'Document session not found or already closed.');
@@ -943,7 +966,6 @@ export class TaskHost {
         { expected: valid.expectedRevision, actual: session.revision }
       );
 
-      const targetPath = path.resolve(valid.outputPath);
       check(
         targetPath.toLowerCase() !== session.originalPath.toLowerCase(),
         'OVERWRITE_SOURCE_PROHIBITED',
@@ -955,11 +977,11 @@ export class TaskHost {
 
       if (session.mode === 'file') {
         const bytes = await session.engine.bytes();
-        const outputParts = await readPackage(bytes);
+        const { parts: outputParts, structural } = await readValidatedPackage(bytes);
         check(outputParts.size === session.engine.parts.size &&
           [...session.engine.parts].every(([name, data]) => outputParts.get(name)?.equals(data)),
         'OUTPUT_MISMATCH', 'Generated package does not match the edited document.');
-        validationReport = { ...session.engine.validate(), structural: validatePackage(outputParts), basis: 'generated-output-bytes' };
+        validationReport = { ...session.engine.validationReport(structural), basis: 'generated-output-bytes' };
         published = await publishNew(targetPath, bytes);
       } else {
         const nativeHost = await this.ensureNativeHost();
@@ -1031,6 +1053,12 @@ export class TaskHost {
       const session = await this.getSession(valid.documentId);
       if (!session || session.closed) return { documentId: valid.documentId, status: 'already_closed' };
 
+      let protectOutput = false;
+      if (!valid.preserveCheckpoint) {
+        await this.loadReviews();
+        protectOutput = await this.containsPublishedOutput(session.directory);
+      }
+
       if (session.mode === 'native-copy') {
         check(this.nativeHost && !this.nativeHost.exited && !this.nativeHost.broken,
           'CLEANUP_UNCONFIRMED', 'Native document close cannot be confirmed; checkpoint retained.');
@@ -1049,7 +1077,7 @@ export class TaskHost {
       session.closed = true;
       await this.recordBinding(valid.documentId, { closed: true });
 
-      if (!valid.preserveCheckpoint) {
+      if (!valid.preserveCheckpoint && !protectOutput) {
         // 清理中间大体积检查点
         if (session.mode === 'file') {
           await fs.rm(path.join(session.directory, 'engine', 'parts'), { recursive: true, force: true }).catch(() => {});
@@ -1064,7 +1092,7 @@ export class TaskHost {
       }
 
       this.sessions.delete(valid.documentId);
-      return { documentId: valid.documentId, status: 'closed' };
+      return { documentId: valid.documentId, status: 'closed', ...(protectOutput ? { checkpointCleanupSkipped: 'published_output' } : {}) };
     } finally {
       await FileLock.release(docLock);
     }
@@ -1076,7 +1104,6 @@ export class TaskHost {
   async finish(params) {
     const valid = contracts.ppt_finish.parse(params);
     await this.init();
-    await this.loadReviews();
 
     const taskLockPath = path.join(this.taskDir, 'locks', 'task.lock');
     const taskLock = await FileLock.acquire(taskLockPath, { context: 'finish' });
@@ -1118,8 +1145,10 @@ export class TaskHost {
       const docsDir = path.join(this.taskDir, 'documents');
       const closeErrors = [];
       if (await exists(docsDir)) {
-        const docEntries = await fs.readdir(docsDir).catch(() => []);
-        for (const docId of docEntries) {
+        const docEntries = await fs.readdir(docsDir, { withFileTypes: true });
+        for (const entry of docEntries) {
+          if (!UUID_REGEX.test(entry.name) || !entry.isDirectory()) continue;
+          const docId = entry.name;
           // Retain every checkpoint until both document close and host shutdown are confirmed.
           try { await this.close({ documentId: docId, preserveCheckpoint: true }); }
           catch (error) { closeErrors.push({ documentId: docId, code: error.code || 'DOCUMENT_CLOSE_FAILED', message: error.message }); }
@@ -1158,7 +1187,9 @@ export class TaskHost {
       }
 
       let checkpointCleanupError = null;
-      if (!valid.preserveCheckpoints) {
+      const protectOutput = !valid.preserveCheckpoints && await this.containsPublishedOutput(docsDir);
+      const cleanupDetails = protectOutput ? { checkpointCleanupSkipped: 'published_output' } : {};
+      if (!valid.preserveCheckpoints && !protectOutput) {
         // 清理大体积中间检查点，保留 task.json、receipts、reviews 最小回执
         try {
           await fs.rm(docsDir, { recursive: true, force: true });
@@ -1174,6 +1205,7 @@ export class TaskHost {
         acceptance,
         finishedAt: new Date().toISOString(),
         shutdownReport,
+        ...cleanupDetails,
         checkpointCleanupError
       });
 
@@ -1183,6 +1215,7 @@ export class TaskHost {
         reviewedCount: valid.reviewIds.length,
         acceptance,
         shutdownReport,
+        ...cleanupDetails,
         checkpointCleanupError
       };
     } finally {

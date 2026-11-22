@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { fork } from 'node:child_process';
+import { execFileSync, fork } from 'node:child_process';
 import { buildDeck } from '../src/build.js';
 import { TaskHost, FileLock, encodeTargetRef, decodeTargetRef, assertTaskDirBoundary } from '../src/task.js';
 import { readPackage } from '../src/ooxml.js';
@@ -431,7 +431,7 @@ test('TaskHost hydrates session across separate instances and checks source exis
   assert.deepEqual(await fs.readFile(sourceFile), sourceBytes);
 });
 
-test('TaskHost preserves reviews, unclosed documents and task metadata across separate instances during finish', async () => {
+test('TaskHost preserves reviews, unclosed documents and task metadata across separate instances during finish', async t => {
   const root = workDir();
   const sourceBytes = await buildDeck(sampleDeck);
   const sourceFile = path.join(root, 'input.pptx');
@@ -463,6 +463,11 @@ test('TaskHost preserves reviews, unclosed documents and task metadata across se
   });
   const reviewId = committed.reviewId;
   assert.ok(reviewId);
+  const documentDir = path.join(host1.taskDir, 'documents', docId);
+  const internalOutput = path.join(documentDir, 'delivery.pptx');
+  await assert.rejects(host1.commit({ documentId: docId, expectedRevision: 1, outputPath: internalOutput,
+    operationId: 'internal-output' }), { code: 'OUTPUT_IN_CHECKPOINT_DIRECTORY' });
+  await assert.rejects(fs.access(internalOutput), { code: 'ENOENT' });
 
   // 读取此时的 task.json 创建时间
   const taskMetaBefore = await host1.constructor.status(host1.taskDir);
@@ -477,6 +482,18 @@ test('TaskHost preserves reviews, unclosed documents and task metadata across se
   const taskMetaAfter = await host2.constructor.status(host2.taskDir);
   assert.equal(taskMetaAfter.createdAt, createdTimestamp);
 
+  const reviewPath = path.join(host2.taskDir, 'reviews', reviewId + '.json');
+  const readFile = fs.readFile.bind(fs);
+  const busy = t.mock.method(fs, 'readFile', (file, ...args) => {
+    if (file === reviewPath) throw Object.assign(new Error('Review temporarily busy'), { code: 'EBUSY' });
+    return readFile(file, ...args);
+  });
+  try {
+    await assert.rejects(host2.finish({ reviewIds: [] }), { code: 'EBUSY' });
+    assert.equal((await TaskHost.status(host2.taskDir)).status, 'active');
+    await fs.access(path.join(documentDir, 'engine', 'revision.json'));
+  } finally { busy.mock.restore(); }
+
   // 尝试不提供 reviewId 直接调用 finish -> 预期 UNREVIEWED_OUTPUTS（实例 2 必须能感知到磁盘上的待审阅项）
   await assert.rejects(
     host2.finish({ reviewIds: [] }),
@@ -484,9 +501,36 @@ test('TaskHost preserves reviews, unclosed documents and task metadata across se
   );
 
   // 提供正确的 reviewId 调用 finish -> 预期成功，且残留的会话被正常清理
-  const finishRes = await host2.finish({ reviewIds: [reviewId], preserveCheckpoints: true });
+  // A task committed by an older version can already have an output inside the cleanup tree.
+  await fs.copyFile(committed.outputPath, internalOutput);
+  await writeJson(reviewPath, { ...committed.reviewBundle, outputPath: internalOutput });
+  const finishRes = await host2.finish({ reviewIds: [reviewId] });
   assert.equal(finishRes.status, 'finished');
   assert.equal(finishRes.reviewedCount, 1);
+  assert.equal(hash(await fs.readFile(internalOutput)), committed.outputHash);
+});
+
+test('a CLI finish during a pending open leaves no registered document in the finished task', { timeout: 20000 }, async t => {
+  const root = workDir(), host = new TaskHost({ baseDir: path.join(root, 'tasks') });
+  await host.init();
+  const source = path.join(root, 'pending.pptx');
+  await fs.writeFile(source, await buildDeck(sampleDeck));
+  const reading = Promise.withResolvers(), resume = Promise.withResolvers(), readFile = fs.readFile.bind(fs);
+  t.mock.method(fs, 'readFile', async (file, ...args) => {
+    if (file === source) { reading.resolve(); await resume.promise; }
+    return readFile(file, ...args);
+  });
+  const opening = host.open({ path: source, mode: 'file', operationId: 'pending' });
+  try {
+    await Promise.race([reading.promise, opening.then(() => assert.fail('Expected a pending source read'))]);
+    const ended = JSON.parse(execFileSync(process.execPath, [path.resolve('src/cli.js'), 'finish',
+      '--base-dir', host.baseDir, '--task', host.taskId, '--reviews', '[]'], { encoding: 'utf8', windowsHide: true, timeout: 15000 }));
+    assert.equal(ended.status, 'finished');
+  } finally { resume.resolve(); }
+  await assert.rejects(opening, { code: 'TASK_ALREADY_FINISHED' });
+  const state = await TaskHost.status(host.taskDir, { operationId: 'pending' });
+  assert.equal(state.operationReceipt.status, 'failed');
+  assert.deepEqual(state.documents, []);
 });
 
 test('Scenario 1: TaskHost enforces directory boundary safety, symlink rejection, and closed/finished lifecycle state', async () => {

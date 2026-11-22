@@ -78,3 +78,7 @@ by the revision manifest.
 On `CLEANUP_UNCONFIRMED`, inspect `ppt_status`, its cleanup report and retained checkpoints. An unknown shutdown is persisted and blocks further close, finish and native startup, including after reconnect. Do not erase the record or blindly retry. Preserve recovery data and report what remains unconfirmed.
 
 Inspect `acceptance`, `shutdownReport` and `checkpointCleanupError` before reporting completion. Confirmed resource cleanup alone does not mean that the output passed review.
+
+If finish cannot read a review record, restore access to that record and retry with
+the same review IDs. Checkpoints remain available. For `OUTPUT_IN_CHECKPOINT_DIRECTORY`,
+choose a destination outside task document checkpoints and use a new commit operation ID.

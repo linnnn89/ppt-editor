@@ -232,6 +232,51 @@ test('file drafts preview exact revisions and committed previews accumulate page
   } finally {await host.cleanupCommand();}
 });
 
+test('strict acceptance keeps real PowerPoint overflow through file checks until a corrected output is measured', {timeout:90000}, async t => {
+  if (listProcesses('POWERPNT.EXE').length) return t.skip('Existing PowerPoint session');
+  const host = makeHost();
+  try {
+    const { documentId } = await host.build({ operationId: 'build', allowOffice: true, deck: {
+      width: 480, height: 300, slides: [{ items: [{ ...text('Multiline', 70), top: 100, width: 180, height: 19,
+        fontSize: 28, text: 'Alpha\nBravo\nCharlie\nDelta\nEcho' }] }]
+    } });
+    const publish = (revision, name) => host.commit({ documentId, expectedRevision: revision,
+      operationId: name, outputPath: path.join(host.baseDir, name + '.pptx') });
+    const render = reviewId => host.render({ documentId, reviewId, slides: [1], allowOffice: true, layoutCheck: true, detail: 'summary' });
+    const strict = reviewId => host.finish({ reviewIds: [reviewId], requireAccepted: true });
+    const initial = await publish(0, 'overflow');
+    const before = await render(initial.reviewId);
+    assert.equal(before.layoutAudit.pages[0].counts.textOverflow, 1);
+    await assert.rejects(strict(initial.reviewId), { code: 'ACCEPTANCE_INCOMPLETE' });
+    const recheck = await host.validate({ documentId, expectedRevision: 0, checks: 'layout', layoutCheck: true, slides: [1] });
+    assert.deepEqual(recheck.layoutAudit.summary.attentionSlides, [1]);
+    assert.equal(recheck.layoutAudit.pages[0].counts.textOverflow, 1);
+    assert.equal(recheck.layoutAudit.coverage.textFitDetails.measured, 1);
+    assert.equal(hash(await fs.readFile(initial.outputPath)), initial.outputHash);
+    await assert.rejects(strict(initial.reviewId), { code: 'ACCEPTANCE_INCOMPLETE' });
+
+    // Resume a pre-fix task whose worklist had already lost the native finding.
+    const worklist = await readJson(recheck.layoutAudit.worklistPath), legacy = structuredClone(worklist);
+    Object.assign(legacy.pages[0], { status: 'clear', issues: [], issueCount: 0 });
+    legacy.pages[0].counts.textOverflow = 0;
+    legacy.pages[0].coverage.textFitDetails = { measured: 0, unmeasured: 1, reasons: { native_readback_not_run: 1 } };
+    await writeJson(recheck.layoutAudit.worklistPath, legacy);
+    await assert.rejects(strict(initial.reviewId), { code: 'ACCEPTANCE_INCOMPLETE' });
+
+    const [object] = (await host.inspect({ documentId, kind: 'text' })).objects;
+    await host.apply({ documentId, expectedRevision: 0, operationId: 'repair', operations: [
+      { type: 'set_geometry', targetRef: object.targetRef, geometry: { top: 35, height: 220 } }
+    ] });
+    const fixed = await publish(1, 'fixed'), after = await render(fixed.reviewId);
+    assert.equal(after.layoutAudit.pages[0].counts.textOverflow, 0);
+    assert.equal(after.layoutAudit.coverage.textFitDetails.measured, 1);
+    const result = await strict(fixed.reviewId);
+    assert.equal(result.acceptance.status, 'accepted');
+    assert.equal(result.shutdownReport.officeExited, true);
+    console.log('OVERFLOW_REGRESSION ' + JSON.stringify({ before: before.images[0].path, after: after.images[0].path }));
+  } finally { await host.cleanupCommand(); }
+});
+
 test('STDIO file refinement preserves real native evidence and accepts the newly rendered output', {timeout:90000}, async t => {
   if(listProcesses('POWERPNT.EXE').length){t.skip('Existing PowerPoint session');return;}
   const root=path.resolve('work/tests/batch-native-evidence',randomUUID());

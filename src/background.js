@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { check } from './errors.js';
 import { hash } from './storage.js';
-import { NS, child, children, descendants, parseXml, xml, relationshipsPath, rels, resolvePart } from './ooxml.js';
+import { NS, child, children, descendants, parseXml, xml, relationshipsPath, relationshipsSource, rels, resolvePart } from './ooxml.js';
 
 // DrawingML preset name and Office MsoPatternType value.
 export const backgroundPatterns = {
@@ -64,7 +64,7 @@ export function setBackgroundXml(parts, slidePart, fill, image, existingDoc) {
     const relationships = parseXml(parts.get(relPart) || Buffer.from(`<Relationships xmlns="${NS.rel}"/>`));
     const target = path.posix.relative(path.posix.dirname(slidePart), imagePart);
     const all = descendants(relationships, NS.rel, 'Relationship');
-    let relation = all.find(r => r.getAttribute('Target') === target && r.getAttribute('Type').endsWith('/image'));
+    let relation = all.find(r => r.getAttribute('TargetMode') !== 'External' && r.getAttribute('Target') === target && r.getAttribute('Type').endsWith('/image'));
     if (!relation) {
       const used = new Set(all.map(r => r.getAttribute('Id'))); let n = 1; while (used.has(`rIdBackground${n}`)) n++;
       relation = relationships.createElementNS(NS.rel, 'Relationship');
@@ -85,6 +85,58 @@ export function setBackgroundXml(parts, slidePart, fill, image, existingDoc) {
     else add(add(picture, 'stretch'), 'fillRect');
   }
   add(props, 'effectLst'); parts.set(slidePart, Buffer.from(xml(doc)));
+}
+
+const generatedMediaName = /^ppt\/media\/bg-([a-f0-9]{64})\.(?:png|jpeg)$/;
+
+export function isGeneratedBackgroundImage(name, data) {
+  const match = generatedMediaName.exec(name);
+  return Boolean(match && data && hash(data) === match[1]);
+}
+
+export function pruneBackgroundImages(parts, editedSlides) {
+  const unused = new Set();
+  for (const [slidePart, doc] of editedSlides) {
+    const relPart = relationshipsPath(slidePart);
+    if (!parts.has(relPart)) continue;
+    const relations = parseXml(parts.get(relPart));
+    const generated = children(relations.documentElement, NS.rel, 'Relationship').filter(node =>
+      /^rIdBackground\d+$/.test(node.getAttribute('Id')) && node.getAttribute('Type') === NS.r + '/image' &&
+      node.getAttribute('TargetMode') !== 'External');
+    if (!generated.length) continue;
+    const usedIds = new Set();
+    for (const node of doc.getElementsByTagName('*')) {
+      for (const attribute of Array.from(node.attributes)) if (attribute.namespaceURI === NS.r) usedIds.add(attribute.value);
+    }
+    let changed = false;
+    for (const node of generated) {
+      const media = resolvePart(slidePart, node.getAttribute('Target'));
+      if (usedIds.has(node.getAttribute('Id')) || !generatedMediaName.test(media)) continue;
+      relations.documentElement.removeChild(node);
+      unused.add(media);
+      changed = true;
+    }
+    if (changed) parts.set(relPart, Buffer.from(xml(relations)));
+  }
+  if (!unused.size) return;
+  // Other pages, masters and pictures may share the same embedded image.
+  for (const name of parts.keys()) {
+    if (!name.endsWith('.rels')) continue;
+    const owner = relationshipsSource(name);
+    for (const rel of rels(parts, owner)) if (!rel.external) unused.delete(resolvePart(owner, rel.target));
+    if (!unused.size) return;
+  }
+  for (const media of unused) {
+    if (isGeneratedBackgroundImage(media, parts.get(media))) parts.delete(media);
+    else unused.delete(media);
+  }
+  if (!unused.size) return;
+  const types = parseXml(parts.get('[Content_Types].xml'));
+  const overrides = children(types.documentElement, NS.ct, 'Override').filter(node => unused.has(node.getAttribute('PartName').slice(1)));
+  if (overrides.length) {
+    for (const node of overrides) types.documentElement.removeChild(node);
+    parts.set('[Content_Types].xml', Buffer.from(xml(types)));
+  }
 }
 
 export function describeBackground(parts, slidePart, bg) {
