@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { buildDeck } from '../src/build.js';
 import { FileEngine } from '../src/file-engine.js';
 import JSZip from 'jszip';
-import { NS, parseXml, descendants, child, xml, readPackage, rels, writePackage, writePackageOptimized, zipManifest } from '../src/ooxml.js';
+import { NS, parseXml, descendants, child, children, xml, readPackage, rels, writePackage, writePackageOptimized, zipManifest } from '../src/ooxml.js';
 import { contracts } from '../src/contracts.js';
 import { hash, stableJson, prepareNewOutput, publishNew } from '../src/storage.js';
 
@@ -167,6 +167,98 @@ test('table and notes stay scoped, invalid archives and unknown arguments fail',
   assert.equal(engine.inspect().objects.find(o => o.kind === 'table').rows[1][1], '18');
   assert.throws(() => zipManifest(Buffer.from('not a presentation')), { code: 'INVALID_PACKAGE' });
   assert.throws(() => contracts.ppt_open.parse({ path: 'file.pptx', operationId: 'open', unexpected: true }));
+});
+
+test('a group reference cannot edit its child tables; a child reference edits only its own table', async () => {
+  const bounds = { left: 40, top: 40, width: 200, height: 50 };
+  const parts = await readPackage(await buildDeck({ slides: [{ notes: 'Group fixture notes', items: [
+    { type: 'table', name: 'Table A', rows: [['A1', 'A2']], ...bounds },
+    { type: 'table', name: 'Table B', rows: [['B1', 'B2']], ...bounds, top: 100 },
+    { type: 'text', name: 'Label', text: 'Original label', ...bounds, top: 160 },
+    { type: 'chart', name: 'Trend', chartType: 'bar', series: [{ name: 'Data', labels: ['Q1'], values: [9] }], ...bounds, top: 220 }
+  ] }] }));
+  const part = 'ppt/slides/slide1.xml', doc = parseXml(parts.get(part)), tree = descendants(doc, NS.p, 'spTree')[0];
+  const groupXml = `<p:grpSp xmlns:p="${NS.p}" xmlns:a="${NS.a}">
+    <p:nvGrpSpPr><p:cNvPr id="90" name="Grouped objects"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+    <p:grpSpPr><a:xfrm><a:off x="508000" y="508000"/><a:ext cx="2540000" cy="2921000"/>
+      <a:chOff x="508000" y="508000"/><a:chExt cx="2540000" cy="2921000"/></a:xfrm></p:grpSpPr>
+  </p:grpSp>`;
+  const groupShape = doc.importNode(parseXml(Buffer.from(groupXml)).documentElement, true);
+  for (const shape of children(tree, NS.p).filter(s => ['graphicFrame', 'sp'].includes(s.localName))) groupShape.appendChild(shape);
+  tree.appendChild(groupShape);
+  parts.set(part, Buffer.from(xml(doc)));
+  const bytes = await writePackage(parts), folder = directory(), engine = await FileEngine.create(folder, bytes);
+  const { objects } = engine.inspect();
+  const [group, tableA, tableB, label, chart] = ['Grouped objects', 'Table A', 'Table B', 'Label', 'Trend'].map(name => objects.find(o => o.name === name));
+  const notes = objects.find(o => o.kind === 'notes');
+  assert.equal(group.kind, 'group');
+  assert.equal(group.key, `slide:${group.slideId}::90`);
+  assert.equal(group.fingerprint, hash(xml(groupShape)));
+  assert.deepEqual(group.geometry, { left: 40, top: 40, width: 200, height: 230, rotation: 0, unit: 'pt', source: 'explicit' });
+  assert.deepEqual(group.capabilities, []);
+  assert.equal(group.text, '');
+  assert.deepEqual(group.runs, []);
+  for (const field of ['rows', 'rowCount', 'columnCount', 'chart', 'smartart']) assert.ok(!(field in group), field);
+  for (const item of [tableA, tableB, label, chart]) {
+    assert.deepEqual(item.groupPath, [90]);
+    assert.equal(item.key, `slide:${group.slideId}:90:${item.shapeId}`);
+  }
+  assert.equal(tableA.kind, 'table');
+  assert.equal(tableB.kind, 'table');
+  assert.deepEqual(tableA.capabilities, ['set_table_cell']);
+  assert.deepEqual(tableB.capabilities, ['set_table_cell']);
+  assert.deepEqual(tableA.rows, [['A1', 'A2']]);
+  assert.deepEqual(tableB.rows, [['B1', 'B2']]);
+  assert.deepEqual(chart.chart.series[0].values, [9]);
+  assert.deepEqual(label.capabilities, ['replace_text', 'set_style']);
+
+  const edit = { type: 'set_table_cell', target: group, row: 1, column: 2, text: 'updated', formatPolicy: 'first_run' };
+  const manifest = path.join(folder, 'revision.json'), originalManifest = await fs.readFile(manifest);
+  for (const dryRun of [true, false]) {
+    await assert.rejects(engine.apply([edit], { dryRun }), { code: 'OPERATION_UNSUPPORTED' });
+    assert.equal(engine.revision, 0);
+    assert.deepEqual(await fs.readFile(manifest), originalManifest);
+    assert.deepEqual(engine.validate().preservation.changedParts, []);
+    assert.deepEqual(await engine.bytes(), bytes);
+  }
+  await engine.apply([{ ...edit, target: tableB }]);
+  assert.equal(engine.revision, 1);
+  assert.deepEqual(engine.validate().preservation.changedParts, [part]);
+  const reopened = await FileEngine.create(directory(), await engine.bytes());
+  const byKey = new Map(reopened.inspect().objects.map(item => [item.key, item]));
+  assert.deepEqual(byKey.get(tableB.key).rows, [['B1', 'updated']]);
+  for (const item of [tableA, label, chart, notes]) assert.deepEqual(byKey.get(item.key), item);
+  for (const [name, data] of parts) if (name !== part) assert.deepEqual(reopened.parts.get(name), data, name);
+  await reopened.apply([{ type: 'replace_text', target: label, search: 'Original', replacement: 'Revised', expectedMatches: 1, crossRunPolicy: 'reject' }]);
+  assert.equal(reopened.inspect().objects.find(o => o.key === label.key).text, 'Revised label');
+});
+
+test('only the table directly owned by a graphic frame supplies cells for inspection and editing', async () => {
+  const parts = await readPackage(await buildDeck(sampleDeck)), part = 'ppt/slides/slide1.xml', doc = parseXml(parts.get(part));
+  const frame = descendants(doc, NS.p, 'graphicFrame')[0], table = descendants(frame, NS.a, 'tbl')[0];
+  // Nonvisual drawing properties may carry application-specific extension data.
+  const extXml = `<a:extLst xmlns:a="${NS.a}"><a:ext uri="{201C3766-DC23-4A44-9DF3-FE96E598F421}">
+    <fixture:data xmlns:fixture="urn:ppt-editor:fixture"/></a:ext></a:extLst>`;
+  for (const shape of [frame, descendants(doc, NS.p, 'sp')[0]]) {
+    const extension = doc.importNode(parseXml(Buffer.from(extXml)).documentElement, true);
+    const copy = table.cloneNode(true);
+    descendants(copy, NS.a, 't')[0].textContent = 'Extension value';
+    descendants(extension, 'urn:ppt-editor:fixture', 'data')[0].appendChild(copy);
+    descendants(shape, NS.p, 'cNvPr')[0].appendChild(extension);
+  }
+  parts.set(part, Buffer.from(xml(doc)));
+  const engine = await FileEngine.create(directory(), await writePackage(parts)), { objects } = engine.inspect();
+  const target = objects.find(o => o.name === 'Data'), heading = objects.find(o => o.name === 'Heading');
+  assert.equal(heading.kind, 'text');
+  assert.ok(!heading.capabilities.includes('set_table_cell'));
+  assert.deepEqual(target.rows, [['Name', 'Value'], ['Alpha', '12']]);
+  await engine.apply([{ type: 'set_table_cell', target, row: 1, column: 1, text: 'Updated', formatPolicy: 'first_run' }]);
+  assert.equal(engine.inspect().objects.find(o => o.key === target.key).rows[0][0], 'Updated');
+  const payloads = descendants(parseXml(engine.parts.get(part)), 'urn:ppt-editor:fixture', 'data');
+  assert.equal(payloads.length, 2);
+  for (const payload of payloads) {
+    assert.equal(descendants(payload, NS.a, 't')[0].textContent, 'Extension value');
+  }
 });
 
 test('slide background can be inspected, modified, persisted and recovered', async () => {

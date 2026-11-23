@@ -31,6 +31,12 @@ function geometryOf(shape) {
   return { left: numeric(offset, 'x', PT), top: numeric(offset, 'y', PT), width: numeric(extent, 'cx', PT), height: numeric(extent, 'cy', PT), rotation: numeric(transform, 'rot', 60000) ?? 0, unit: 'pt', source: transform ? 'explicit' : 'inherited-unresolved' };
 }
 
+function tableOf(shape) {
+  if (shape.namespaceURI !== NS.p || shape.localName !== 'graphicFrame') return null;
+  const graphic = child(shape, NS.a, 'graphic');
+  return child(child(graphic, NS.a, 'graphicData'), NS.a, 'tbl');
+}
+
 export function indexPackage(parts, { slides: selected } = {}) {
   const presentation = parseXml(parts.get('ppt/presentation.xml'));
   const relationMap = new Map(rels(parts, 'ppt/presentation.xml').map(r => [r.id, r]));
@@ -75,30 +81,37 @@ export function indexPackage(parts, { slides: selected } = {}) {
         const identity = descendants(shape, NS.p, 'cNvPr')[0];
         if (!identity) continue;
         const id = Number(identity.getAttribute('id'));
-        const body = child(shape, NS.p, 'txBody');
-        const table = descendants(shape, NS.a, 'tbl')[0];
         const placeholder = descendants(shape, NS.p, 'ph')[0];
         if (notes && placeholder?.getAttribute('type') !== 'body') continue;
-        const advanced = advancedObject(parts, sourcePart, shape);
-        const kind = notes ? 'notes' : advanced.kind || (table ? 'table' : body ? 'text' : shape.localName === 'pic' ? 'image' : shape.localName === 'grpSp' ? 'group' : 'shape');
-        const tableRows = table ? children(table, NS.a, 'tr').map(row => children(row, NS.a, 'tc').map(cell => textBodyText(child(cell, NS.a, 'txBody')))) : undefined;
         const key = `${notes ? 'notes' : 'slide'}:${slideId}:${groups.join('.')}:${id}`;
+        const common = {
+          key, part: sourcePart, slide: slideNumber, slideId, shapeId: id, groupPath: groups, name: identity.getAttribute('name') || '',
+          geometry: geometryOf(shape), fingerprint: hash(xml(shape))
+        };
+        slide.objectCount++;
+        if (shape.localName === 'grpSp') {
+          objects.push({ ...common, kind: notes ? 'notes' : 'group', text: '', runs: [], placeholder: null, capabilities: [] });
+          visit(shape, [...groups, id], notes, sourcePart);
+          continue;
+        }
+        const body = child(shape, NS.p, 'txBody');
+        const table = tableOf(shape);
+        const advanced = advancedObject(parts, sourcePart, shape);
+        const kind = notes ? 'notes' : advanced.kind || (table ? 'table' : body ? 'text' : shape.localName === 'pic' ? 'image' : 'shape');
+        const tableRows = table ? children(table, NS.a, 'tr').map(row => children(row, NS.a, 'tc').map(cell => textBodyText(child(cell, NS.a, 'txBody')))) : undefined;
         const item = {
-          ...advanced,
-          key, part: sourcePart, slide: slideNumber, slideId, shapeId: id, groupPath: groups, name: identity.getAttribute('name') || '', kind,
+          ...common, ...advanced, kind,
           text: body ? textBodyText(body) : tableRows ? tableRows.map(row => row.join('\t')).join('\n') : '',
-          geometry: geometryOf(shape), placeholder: placeholder?.getAttribute('type') || null,
+          placeholder: placeholder?.getAttribute('type') || null,
           runs: body ? children(body, NS.a, 'p').flatMap((p, paragraph) => children(p, NS.a, 'r').map(r => ({ paragraph, text: child(r, NS.a, 't')?.textContent || '', style: runStyle(r) }))) : [],
           ...(tableRows ? { rows: tableRows, rowCount: tableRows.length, columnCount: tableRows[0]?.length || 0 } : {})
         };
-        item.fingerprint = hash(xml(shape));
         item.capabilities = [
           ...(body ? ['replace_text', 'set_style'] : []), ...(table ? ['set_table_cell'] : []),
-          ...(!notes && groups.length === 0 && kind !== 'group' && (item.geometry.source === 'explicit' ||
+          ...(!notes && groups.length === 0 && (item.geometry.source === 'explicit' ||
             (shape.localName === 'sp' && placeholder && child(shape, NS.p, 'spPr'))) ? ['set_geometry'] : [])
         ];
-        objects.push(item); slide.objectCount++;
-        if (shape.localName === 'grpSp') visit(shape, [...groups, id], notes, sourcePart);
+        objects.push(item);
       }
     }
     if (tree) visit(tree);
@@ -308,7 +321,7 @@ export class FileEngine {
         for (const [key, attr] of [['width', 'cx'], ['height', 'cy']]) if (op.geometry[key] !== undefined) extent.setAttribute(attr, String(Math.round(op.geometry[key] * PT)));
         if (op.geometry.rotation !== undefined) transform.setAttribute('rot', String(Math.round(((op.geometry.rotation % 360 + 360) % 360) * 60000)));
       }
-      if (op.type === 'set_table_cell') setCell(descendants(shape, NS.a, 'tbl')[0], op);
+      if (op.type === 'set_table_cell') setCell(tableOf(shape), op);
       changes.push({ type: op.type, key: item.key, ...detail });
     }
     reportProgress('preparing-edits', { completed: operations.length, total: operations.length, unit: 'operations' });
