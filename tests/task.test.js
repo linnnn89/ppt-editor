@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync, fork } from 'node:child_process';
 import { buildDeck } from '../src/build.js';
 import { TaskHost, FileLock, encodeTargetRef, decodeTargetRef, assertTaskDirBoundary } from '../src/task.js';
-import { readPackage } from '../src/ooxml.js';
+import { NS, child, children, descendants, parseXml, readPackage, writePackage, xml } from '../src/ooxml.js';
 import { FileEngine } from '../src/file-engine.js';
 import { hash, writeJson, stableJson } from '../src/storage.js';
 
@@ -93,6 +93,79 @@ test('targetRef encoding and decoding binds full context', () => {
   const decodedBg = decodeTargetRef(bgRef);
   assert.equal(decodedBg.kind, 'background');
   assert.equal(decodedBg.key, 'background:256::0');
+});
+
+test('slide and notes groups with matching IDs keep distinct file-mode references', async t => {
+  const root = workDir(), host = new TaskHost({ baseDir: path.join(root, 'tasks') });
+  t.after(async () => { await host.cleanupCommand(); await fs.rm(root, { recursive: true, force: true }); });
+  const parts = await readPackage(await buildDeck({ slides: [{
+    notes: 'Original notes', items: [{ type: 'text', name: 'Slide text', text: 'Original slide', left: 10, top: 10, width: 100, height: 30 }]
+  }] }));
+  const slidePart = 'ppt/slides/slide1.xml', notesPart = 'ppt/notesSlides/notesSlide1.xml';
+  for (const [part, name, x] of [[slidePart, 'Slide group', 0], [notesPart, 'Notes group', -1270000]]) {
+    const doc = parseXml(parts.get(part)), tree = descendants(doc, NS.p, 'spTree')[0];
+    const member = children(tree, NS.p, 'sp').find(shape =>
+      part === slidePart || descendants(shape, NS.p, 'ph')[0]?.getAttribute('type') === 'body');
+    child(child(member, NS.p, 'nvSpPr'), NS.p, 'cNvPr').setAttribute('id', '60');
+    const groupXml = `<p:grpSp xmlns:p="${NS.p}" xmlns:a="${NS.a}">
+      <p:nvGrpSpPr><p:cNvPr id="90" name="${name}"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="${x}" y="0"/><a:ext cx="1905000" cy="762000"/>
+        <a:chOff x="0" y="0"/><a:chExt cx="1905000" cy="762000"/></a:xfrm></p:grpSpPr>
+    </p:grpSp>`;
+    const group = doc.importNode(parseXml(Buffer.from(groupXml)).documentElement, true);
+    tree.replaceChild(group, member);
+    group.appendChild(member);
+    parts.set(part, Buffer.from(xml(doc)));
+  }
+  const bytes = await writePackage(parts), source = path.join(root, 'grouped-notes.pptx');
+  await fs.mkdir(root, { recursive: true });
+  await fs.writeFile(source, bytes);
+  const { documentId } = await host.open({ path: source, mode: 'file', operationId: 'open' });
+  const { objects, slides } = await host.inspect({ documentId });
+  const slideId = slides[0].slideId;
+  const find = key => objects.find(o => o.key === key);
+  const slideGroup = find(`slide:${slideId}::90`), notesGroup = find(`notes:${slideId}::90`);
+  const slideText = find(`slide:${slideId}:90:60`), notesText = find(`notes:${slideId}:90:60`);
+  for (const item of [slideGroup, notesGroup, slideText, notesText]) {
+    const decoded = decodeTargetRef(item.targetRef);
+    assert.equal(decoded.key, item.key);
+    assert.equal(decoded.part, item.part);
+    assert.equal(decoded.fingerprint, item.fingerprint);
+  }
+  assert.equal(slideGroup.kind, 'group');
+  assert.equal(notesGroup.kind, 'notes');
+  assert.deepEqual((await host.inspect({ documentId, kind: 'notes' })).objects.map(o => o.key),
+    [notesGroup.key, notesText.key]);
+  const { layoutAudit } = await host.validate({ documentId, layoutCheck: true, detail: 'full' });
+  const [page] = layoutAudit.pages;
+  assert.equal(page.objectsChecked, 1); // Only the slide group has resolved slide-space bounds.
+  assert.equal(page.counts.outOfBounds, 0); // The notes group extends beyond the slide.
+  assert.deepEqual(page.issues.map(issue => issue.object.key), [slideText.key]);
+
+  for (const group of [slideGroup, notesGroup]) {
+    assert.deepEqual(group.capabilities, []);
+    for (const dryRun of [true, false]) {
+      await assert.rejects(host.apply({ documentId, expectedRevision: 0, operationId: randomUUID(), dryRun,
+        operations: [{ type: 'replace_text', targetRef: group.targetRef, search: 'Original', replacement: 'Changed', expectedMatches: 1 }]
+      }), { code: 'OPERATION_UNSUPPORTED' });
+      const restored = await FileEngine.restore((await host.getSession(documentId)).engine.directory);
+      assert.equal(restored.revision, 0);
+      assert.deepEqual(await restored.bytes(), bytes);
+    }
+  }
+
+  const applied = await host.apply({ documentId, expectedRevision: 0, operationId: 'edit-notes', operations: [
+    { type: 'replace_text', targetRef: notesText.targetRef, search: 'Original', replacement: 'Revised', expectedMatches: 1 }
+  ] });
+  assert.equal(applied.revision, 1);
+  const after = (await host.inspect({ documentId })).objects;
+  assert.equal(after.find(o => o.key === notesText.key).text, 'Revised notes');
+  assert.equal(after.find(o => o.key === slideText.key).text, slideText.text);
+  const engine = (await host.getSession(documentId)).engine;
+  assert.deepEqual(engine.validate().preservation.changedParts, [notesPart]);
+  const saved = await readPackage(await engine.bytes());
+  for (const [part, data] of parts) if (part !== notesPart) assert.deepEqual(saved.get(part), data, part);
+  assert.deepEqual(await fs.readFile(source), bytes);
 });
 
 test('TaskHost executes full file-mode edit lifecycle with source protection', async () => {

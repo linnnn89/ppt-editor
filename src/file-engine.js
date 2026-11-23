@@ -90,7 +90,7 @@ export function indexPackage(parts, { slides: selected } = {}) {
         };
         slide.objectCount++;
         if (shape.localName === 'grpSp') {
-          objects.push({ ...common, kind: 'group', text: '', runs: [], placeholder: null, capabilities: [] });
+          objects.push({ ...common, kind: notes ? 'notes' : 'group', text: '', runs: [], placeholder: null, capabilities: [] });
           visit(shape, [...groups, id], notes, sourcePart);
           continue;
         }
